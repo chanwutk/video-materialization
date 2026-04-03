@@ -1,10 +1,17 @@
 import argparse
 import asyncio
 import json
+from dataclasses import dataclass
 
 import matplotlib.pyplot as plt
 import pandas as pd
-from tqdm import tqdm
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    TextColumn,
+    TimeRemainingColumn,
+)
 
 from .config import (
     MODEL_NAME, SEGMENT_LENGTH_S, TOP_K_VIDEOS, TOP_K_CANDIDATES,
@@ -19,7 +26,26 @@ from .segmenter import segment_video
 from .tokens import PolicyTokenLog
 
 ALL_POLICIES = "raw,transcript,visual-description,summary,low-fps,low-res,mixed"
-DEFAULT_CONCURRENCY = 128
+DEFAULT_CONCURRENCY = 512
+
+# Description, bar, completed/total (e.g. 42/100), ETA — same as Rich defaults but with counts.
+_PROGRESS_COLUMNS = (
+    TextColumn("[progress.description]{task.description}"),
+    BarColumn(),
+    MofNCompleteColumn(),
+    TimeRemainingColumn(),
+)
+
+
+@dataclass
+class Pbar:
+    """Progress bar adapter for asyncio.Semaphore."""
+
+    progress: Progress
+    task_id: int
+
+    def update(self, n: int = 1) -> None:
+        self.progress.update(self.task_id, advance=n)
 
 
 def parse_args():
@@ -124,7 +150,9 @@ async def run_experiment_async(args):
     n_build_calls = total_segments + total_segments + n_videos * 2
 
     build_tasks = []
-    with tqdm(total=n_build_calls, desc="  Building") as pbar:
+    with Progress(*_PROGRESS_COLUMNS) as progress:
+        task_id = progress.add_task("  Building", total=n_build_calls)
+        pbar = Pbar(progress, task_id)
         for vid in selected:
             youtube_url = f"https://www.youtube.com/watch?v={vid}"
             segs = video_segments[vid]
@@ -157,7 +185,9 @@ async def run_experiment_async(args):
         # Build all query tasks
         query_tasks = []
         task_meta = []
-        with tqdm(total=total_questions, desc=f"  {policy.value}") as pbar:
+        with Progress(*_PROGRESS_COLUMNS) as progress:
+            task_id = progress.add_task(f"  {policy.value}", total=total_questions)
+            pbar = Pbar(progress, task_id)
             for vid in selected:
                 youtube_url = f"https://www.youtube.com/watch?v={vid}"
                 segs = video_segments[vid]
