@@ -1,8 +1,12 @@
+from dataclasses import dataclass
 from enum import Enum
 
 from google import genai
 
-from .builders import build_transcript, build_keyframes, build_summary
+from .builders import (
+    build_transcript, build_segment_summary,
+    build_visual_description, build_whole_summary,
+)
 from .config import SPEECH_DENSE_WORD_THRESHOLD, VISUALLY_ACTIVE_WORD_THRESHOLD, MODEL_NAME
 from .segmenter import Segment
 from .tokens import TokenUsage
@@ -11,9 +15,17 @@ from .tokens import TokenUsage
 class Policy(Enum):
     RAW = "raw"
     TRANSCRIPT = "transcript"
-    KEYFRAMES = "keyframes"
+    VISUAL_DESCRIPTION = "visual-description"
     SUMMARY = "summary"
+    LOW_FPS = "low-fps"
     MIXED = "mixed"
+
+
+@dataclass
+class SegmentMaterial:
+    text: str | None       # materialized text (None for video-based segments)
+    material_type: str     # "transcript", "visual-description", "summary", "low-fps", "raw"
+    is_video: bool = False # True if query should send video Part instead of text
 
 
 def _word_count(text: str) -> int:
@@ -21,14 +33,15 @@ def _word_count(text: str) -> int:
 
 
 def _pick_mixed_material(
-    transcript: str, keyframes: str, summary: str,
-) -> tuple[str, str]:
-    """Returns (chosen_text, chosen_type) for mixed policy routing."""
+    transcript: str, summary: str,
+) -> SegmentMaterial:
+    """Route a segment for the mixed policy (3 tiers)."""
     if _word_count(transcript) > SPEECH_DENSE_WORD_THRESHOLD:
-        return transcript, "transcript"
-    if _word_count(keyframes) > VISUALLY_ACTIVE_WORD_THRESHOLD:
-        return keyframes, "keyframes"
-    return summary, "summary"
+        return SegmentMaterial(text=transcript, material_type="transcript")
+    if _word_count(transcript) > 0 or _word_count(summary) > VISUALLY_ACTIVE_WORD_THRESHOLD:
+        # Has some content suggesting visual activity -> low-fps video
+        return SegmentMaterial(text=None, material_type="low-fps", is_video=True)
+    return SegmentMaterial(text=summary, material_type="summary")
 
 
 def materialize_video(
@@ -38,46 +51,56 @@ def materialize_video(
     youtube_url: str,
     segments: list[Segment],
     model: str = MODEL_NAME,
-) -> tuple[dict[int, str | None], list[TokenUsage]]:
+) -> tuple[dict[int, SegmentMaterial], list[TokenUsage]]:
     """
-    Materialize all segments for a given policy.
+    Materialize a video for a given policy.
 
     Returns:
-        materialized: dict mapping segment index -> materialized text (None for RAW)
+        materialized: dict mapping segment index -> SegmentMaterial
         build_usages: list of TokenUsage from builder calls
     """
-    materialized: dict[int, str | None] = {}
+    materialized: dict[int, SegmentMaterial] = {}
     build_usages: list[TokenUsage] = []
 
     if policy == Policy.RAW:
-        for seg in segments:
-            materialized[seg.index] = None
+        # No build, query sends full video at default fps
+        materialized[0] = SegmentMaterial(text=None, material_type="raw", is_video=True)
         return materialized, build_usages
 
-    for seg in segments:
-        if policy == Policy.TRANSCRIPT:
+    if policy == Policy.LOW_FPS:
+        # No build, query sends full video at low fps
+        materialized[0] = SegmentMaterial(text=None, material_type="low-fps", is_video=True)
+        return materialized, build_usages
+
+    if policy == Policy.VISUAL_DESCRIPTION:
+        # Whole-video visual description
+        text, usage = build_visual_description(client, video_id, youtube_url, model=model)
+        build_usages.append(usage)
+        materialized[0] = SegmentMaterial(text=text, material_type="visual-description")
+        return materialized, build_usages
+
+    if policy == Policy.SUMMARY:
+        # Whole-video summary
+        text, usage = build_whole_summary(client, video_id, youtube_url, model=model)
+        build_usages.append(usage)
+        materialized[0] = SegmentMaterial(text=text, material_type="summary")
+        return materialized, build_usages
+
+    if policy == Policy.TRANSCRIPT:
+        # Per-segment transcript
+        for seg in segments:
             text, usage = build_transcript(client, video_id, youtube_url, seg, model=model)
-            materialized[seg.index] = text
             build_usages.append(usage)
+            materialized[seg.index] = SegmentMaterial(text=text, material_type="transcript")
+        return materialized, build_usages
 
-        elif policy == Policy.KEYFRAMES:
-            text, usage = build_keyframes(client, video_id, youtube_url, seg, model=model)
-            materialized[seg.index] = text
-            build_usages.append(usage)
-
-        elif policy == Policy.SUMMARY:
-            text, usage = build_summary(client, video_id, youtube_url, seg, model=model)
-            materialized[seg.index] = text
-            build_usages.append(usage)
-
-        elif policy == Policy.MIXED:
-            # Build all three (cached if already done by other policies)
+    if policy == Policy.MIXED:
+        # Per-segment: build transcript + summary, then route
+        for seg in segments:
             t_text, t_usage = build_transcript(client, video_id, youtube_url, seg, model=model)
-            k_text, k_usage = build_keyframes(client, video_id, youtube_url, seg, model=model)
-            s_text, s_usage = build_summary(client, video_id, youtube_url, seg, model=model)
-            build_usages.extend([t_usage, k_usage, s_usage])
+            s_text, s_usage = build_segment_summary(client, video_id, youtube_url, seg, model=model)
+            build_usages.extend([t_usage, s_usage])
+            materialized[seg.index] = _pick_mixed_material(t_text, s_text)
+        return materialized, build_usages
 
-            chosen_text, _ = _pick_mixed_material(t_text, k_text, s_text)
-            materialized[seg.index] = chosen_text
-
-    return materialized, build_usages
+    raise ValueError(f"Unknown policy: {policy}")

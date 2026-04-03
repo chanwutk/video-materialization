@@ -13,6 +13,11 @@ def cache_key(video_id: str, segment_index: int, builder_type: str) -> str:
     return f"{safe_id}_seg{segment_index:02d}_{builder_type}"
 
 
+def whole_video_cache_key(video_id: str, builder_type: str) -> str:
+    safe_id = video_id.replace("/", "_").replace("\\", "_")
+    return f"{safe_id}_whole_{builder_type}"
+
+
 def load_builder_cache(key: str) -> dict | None:
     _ensure_dir(BUILDERS_CACHE_DIR)
     path = BUILDERS_CACHE_DIR / f"{key}.json"

@@ -17,6 +17,8 @@ from .runner import answer_question
 from .segmenter import segment_video
 from .tokens import PolicyTokenLog
 
+ALL_POLICIES = "raw,transcript,visual-description,summary,low-fps,mixed"
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Video Materialization Experiment")
@@ -24,7 +26,7 @@ def parse_args():
     parser.add_argument("--segment-length", type=int, default=SEGMENT_LENGTH_S)
     parser.add_argument("--model", type=str, default=MODEL_NAME)
     parser.add_argument(
-        "--policies", type=str, default="raw,transcript,keyframes,summary,mixed",
+        "--policies", type=str, default=ALL_POLICIES,
         help="Comma-separated list of policies to run",
     )
     parser.add_argument("--dry-run", action="store_true", help="Load data and print plan without API calls")
@@ -36,19 +38,16 @@ def select_videos(top_k: int):
     entries = download_minerva()
     grouped = group_by_video(entries)
 
-    # Over-select candidates
     candidates = select_top_k(grouped, TOP_K_CANDIDATES)
 
     print(f"\nFetching durations for {len(candidates)} candidate videos...")
     durations = get_durations_for_videos(list(candidates.keys()))
 
-    # Filter to videos with valid durations, take top-K
     valid_videos = {
         vid: candidates[vid]
         for vid in candidates
         if vid in durations
     }
-    # Re-sort by question count and take top-K
     sorted_valid = sorted(valid_videos.items(), key=lambda x: len(x[1]), reverse=True)
     selected = dict(sorted_valid[:top_k])
 
@@ -87,31 +86,53 @@ def run_experiment(args):
             print(f"  {vid}: {len(segs)} segments, {len(selected[vid])} questions")
 
         # Estimate API calls
-        n_builder_calls = total_segments * 3  # all three builders for reuse
+        n_videos = len(selected)
+        # Build phase: transcript (per-segment) + segment-summary (per-segment, for mixed)
+        #   + visual-description (whole-video) + whole-summary (whole-video)
+        n_transcript_calls = total_segments
+        n_seg_summary_calls = total_segments  # for mixed
+        n_whole_video_calls = n_videos * 2  # visual-description + whole-summary
+        n_builder_calls = n_transcript_calls + n_seg_summary_calls + n_whole_video_calls
+
+        # Query phase
         n_query_calls = total_questions * len(policies)
-        n_raw_query_calls = total_questions if Policy.RAW in policies else 0
+
         print(f"\nEstimated API calls:")
         print(f"  Builder calls: {n_builder_calls}")
+        print(f"    Transcript (per-segment): {n_transcript_calls}")
+        print(f"    Segment summary (per-segment, for mixed): {n_seg_summary_calls}")
+        print(f"    Whole-video (visual-desc + summary): {n_whole_video_calls}")
         print(f"  Query calls: {n_query_calls}")
-        print(f"  (of which RAW video queries: {n_raw_query_calls})")
+        n_video_query = sum(
+            total_questions for p in policies
+            if p in (Policy.RAW, Policy.LOW_FPS)
+        )
+        print(f"    (of which video-input queries: {n_video_query})")
         return
 
     # Initialize Gemini client
     from google import genai
     client = genai.Client()
 
-    # Phase 1: Build materializations for all videos
+    # Phase 1: Pre-build all materializations
     print("\n=== Phase 1: Building materializations ===")
-    all_build_usages: dict[str, list] = {vid: [] for vid in selected}
 
-    for vid in tqdm(selected, desc="Building materials"):
+    # Build transcript + segment-summary for all segments (used by transcript, mixed)
+    for vid in tqdm(selected, desc="Building per-segment materials"):
         youtube_url = f"https://www.youtube.com/watch?v={vid}"
         segs = video_segments[vid]
-        # Build all three types for every segment (cached after first run)
-        for builder_type in ["transcript", "keyframes", "summary"]:
-            p = Policy(builder_type)
-            _, usages = materialize_video(client, p, vid, youtube_url, segs, model=model)
-            all_build_usages[vid].extend(usages)
+        # Transcript policy will build transcripts; mixed will also need them (cached)
+        materialize_video(client, Policy.TRANSCRIPT, vid, youtube_url, segs, model=model)
+        # Mixed needs per-segment summaries too — trigger build via mixed
+        # (builds transcript + summary per segment, picks routing)
+        materialize_video(client, Policy.MIXED, vid, youtube_url, segs, model=model)
+
+    # Build whole-video materials
+    for vid in tqdm(selected, desc="Building whole-video materials"):
+        youtube_url = f"https://www.youtube.com/watch?v={vid}"
+        segs = video_segments[vid]
+        materialize_video(client, Policy.VISUAL_DESCRIPTION, vid, youtube_url, segs, model=model)
+        materialize_video(client, Policy.SUMMARY, vid, youtube_url, segs, model=model)
 
     # Phase 2: Run queries for each policy
     print("\n=== Phase 2: Running queries ===")
@@ -124,7 +145,6 @@ def run_experiment(args):
             youtube_url = f"https://www.youtube.com/watch?v={vid}"
             segs = video_segments[vid]
 
-            # Get materialized content for this policy
             materialized, build_usages = materialize_video(
                 client, policy, vid, youtube_url, segs, model=model,
             )

@@ -23,3 +23,6 @@ DURATIONS_CACHE = CACHE_DIR / "durations.json"
 # Three-tier mixed routing thresholds
 SPEECH_DENSE_WORD_THRESHOLD = 30
 VISUALLY_ACTIVE_WORD_THRESHOLD = 50
+
+# Low-FPS policy
+LOW_FPS_RATE = 0.2
