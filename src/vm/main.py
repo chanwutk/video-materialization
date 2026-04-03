@@ -9,6 +9,7 @@ from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
     Progress,
+    TaskProgressColumn,
     TextColumn,
     TimeRemainingColumn,
 )
@@ -18,22 +19,29 @@ from .config import (
     RESULTS_DIR, DATA_DIR,
 )
 from .dataset import download_minerva, group_by_video, select_top_k
-from .duration import get_durations_for_videos
+from .duration import get_durations_for_videos, read_duration_cache
 from .evaluator import evaluate
-from .policies import Policy, materialize_video
+from .policies import (
+    PHASE1_PREBUILD_POLICIES,
+    Policy,
+    materialize_video,
+    phase1_prebuild_total_calls,
+    prebuild_gemini_call_count,
+)
 from .runner import answer_question
 from .segmenter import segment_video
 from .tokens import PolicyTokenLog
 
-ALL_POLICIES = "raw,transcript,visual-description,summary,low-fps,low-res,mixed"
-DEFAULT_CONCURRENCY = 512
+ALL_POLICIES = "raw,transcript,visual-description,summary,low-fps,mixed"
+DEFAULT_CONCURRENCY = 1024
 
-# Description, bar, completed/total (e.g. 42/100), ETA — same as Rich defaults but with counts.
+# Description, bar, completed/total, %, ETA.
 _PROGRESS_COLUMNS = (
     TextColumn("[progress.description]{task.description}"),
     BarColumn(),
     MofNCompleteColumn(),
-    TimeRemainingColumn(),
+    TaskProgressColumn(),
+    # TimeRemainingColumn(),
 )
 
 
@@ -68,7 +76,9 @@ def select_videos(top_k: int):
     entries = download_minerva()
     grouped = group_by_video(entries)
 
-    candidates = select_top_k(grouped, TOP_K_CANDIDATES)
+    candidates = select_top_k(
+        grouped, TOP_K_CANDIDATES, duration_hint=read_duration_cache(),
+    )
 
     print(f"\nFetching durations for {len(candidates)} candidate videos...")
     durations = get_durations_for_videos(list(candidates.keys()))
@@ -78,7 +88,11 @@ def select_videos(top_k: int):
         for vid in candidates
         if vid in durations
     }
-    sorted_valid = sorted(valid_videos.items(), key=lambda x: len(x[1]), reverse=True)
+    sorted_valid = sorted(
+        valid_videos.items(),
+        key=lambda x: (len(x[1]), durations[x[0]]),
+        reverse=True,
+    )
     selected = dict(sorted_valid[:top_k])
 
     print(f"\nFinal selection: {len(selected)} videos with valid durations")
@@ -116,18 +130,14 @@ async def run_experiment_async(args):
         for vid, segs in video_segments.items():
             print(f"  {vid}: {len(segs)} segments, {len(selected[vid])} questions")
 
-        n_videos = len(selected)
-        n_transcript_calls = total_segments
-        n_seg_summary_calls = total_segments
-        n_whole_video_calls = n_videos * 2
-        n_builder_calls = n_transcript_calls + n_seg_summary_calls + n_whole_video_calls
+        n_builder_calls = phase1_prebuild_total_calls(video_segments)
         n_query_calls = total_questions * len(policies)
 
         print(f"\nEstimated API calls:")
         print(f"  Builder calls: {n_builder_calls}")
-        print(f"    Transcript (per-segment): {n_transcript_calls}")
-        print(f"    Segment summary (per-segment, for mixed): {n_seg_summary_calls}")
-        print(f"    Whole-video (visual-desc + summary): {n_whole_video_calls}")
+        for p in PHASE1_PREBUILD_POLICIES:
+            per_run = sum(prebuild_gemini_call_count(p, len(segs)) for segs in video_segments.values())
+            print(f"    {p.value}: {per_run}")
         print(f"  Query calls: {n_query_calls}")
         n_video_query = sum(
             total_questions for p in policies
@@ -143,11 +153,7 @@ async def run_experiment_async(args):
 
     # Phase 1: Pre-build all materializations concurrently
     print("\n=== Phase 1: Building materializations ===")
-    # Count individual builder calls for accurate progress
-    total_segments = sum(len(s) for s in video_segments.values())
-    n_videos = len(selected)
-    # transcript (per-seg) + summary (per-seg, for mixed, transcript cached) + 2 whole-video
-    n_build_calls = total_segments + total_segments + n_videos * 2
+    n_build_calls = phase1_prebuild_total_calls(video_segments)
 
     build_tasks = []
     with Progress(*_PROGRESS_COLUMNS) as progress:
@@ -156,10 +162,12 @@ async def run_experiment_async(args):
         for vid in selected:
             youtube_url = f"https://www.youtube.com/watch?v={vid}"
             segs = video_segments[vid]
-            build_tasks.append(materialize_video(client, Policy.TRANSCRIPT, vid, youtube_url, segs, sem, model=model, pbar=pbar))
-            build_tasks.append(materialize_video(client, Policy.MIXED, vid, youtube_url, segs, sem, model=model, pbar=pbar))
-            build_tasks.append(materialize_video(client, Policy.VISUAL_DESCRIPTION, vid, youtube_url, segs, sem, model=model, pbar=pbar))
-            build_tasks.append(materialize_video(client, Policy.SUMMARY, vid, youtube_url, segs, sem, model=model, pbar=pbar))
+            for policy in PHASE1_PREBUILD_POLICIES:
+                build_tasks.append(
+                    materialize_video(
+                        client, policy, vid, youtube_url, segs, sem, model=model, pbar=pbar,
+                    ),
+                )
 
         await asyncio.gather(*build_tasks)
     print("  Build phase complete.")

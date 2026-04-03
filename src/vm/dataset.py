@@ -25,8 +25,19 @@ def group_by_video(entries: list[dict]) -> dict[str, list[dict]]:
     return grouped
 
 
-def select_top_k(grouped: dict[str, list[dict]], k: int) -> dict[str, list[dict]]:
-    sorted_videos = sorted(grouped.items(), key=lambda x: len(x[1]), reverse=True)
+def select_top_k(
+    grouped: dict[str, list[dict]],
+    k: int,
+    *,
+    duration_hint: dict[str, float] | None = None,
+) -> dict[str, list[dict]]:
+    def sort_key(item: tuple[str, list[dict]]) -> tuple[int, float]:
+        vid, qs = item
+        n = len(qs)
+        dur = duration_hint.get(vid, 0.0) if duration_hint else 0.0
+        return (n, dur)
+
+    sorted_videos = sorted(grouped.items(), key=sort_key, reverse=True)
     selected = dict(sorted_videos[:k])
 
     counts = Counter(len(qs) for qs in selected.values())

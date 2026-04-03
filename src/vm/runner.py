@@ -1,4 +1,5 @@
 import asyncio
+import json
 import re
 from typing import Any
 
@@ -7,7 +8,7 @@ from google.genai import types
 
 from .cache import answer_cache_key, load_answer_cache, save_answer_cache
 from .config import LOW_FPS_RATE, LOW_RES_MEDIA_RESOLUTION, MODEL_NAME
-from .genai_config import GEMINI_GENERATE_CONTENT_CONFIG
+from .genai_config import GEMINI_QA_GENERATE_CONTENT_CONFIG
 from .genai_response import split_main_and_thought_texts
 from .policies import Policy, SegmentMaterial
 from .segmenter import Segment
@@ -16,7 +17,7 @@ from .tokens import TokenUsage
 
 LETTER_TO_INDEX = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4}
 DIGIT_TO_INDEX = {"1": 0, "2": 1, "3": 2, "4": 3, "5": 4}
-ANSWER_PROMPT_CACHE_VERSION = "minerva-direct-v2"
+ANSWER_PROMPT_CACHE_VERSION = "minerva-json-schema-v1"
 
 MATERIALIZATION_PREAMBLE = """\
 Below is pre-computed context for a video.
@@ -46,8 +47,8 @@ def _build_question_text(entry: dict) -> str:
         "Possible answer choices:",
         *choices,
         "",
-        'Output the final answer in the format "Final Answer: (X)" where X is the correct digit choice.',
-        "Do not output any explanation or the full answer text.",
+        'Respond with JSON only: an object with integer field "choice" equal to '
+        "the correct option number (1, 2, 3, 4, or 5).",
     ]
     return "\n".join(lines)
 
@@ -126,27 +127,63 @@ def _build_video_parts(
     return [types.Part(**part_kwargs), types.Part(text=_build_question_text(entry))]
 
 
+def _choice_to_index(choice: str) -> int | None:
+    if choice in LETTER_TO_INDEX:
+        return LETTER_TO_INDEX[choice]
+    if choice in DIGIT_TO_INDEX:
+        return DIGIT_TO_INDEX[choice]
+    return None
+
+
+def _parse_answer_json(response_text: str) -> int | None:
+    stripped = response_text.strip()
+    if not stripped:
+        return None
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    choice = data.get("choice")
+    if isinstance(choice, int) and 1 <= choice <= 5:
+        return choice - 1
+    return None
+
+
 def _parse_answer(response_text: str) -> int | None:
-    normalized = response_text.strip().upper()
+    stripped = response_text.strip()
+    if stripped:
+        first_line = stripped.splitlines()[0].strip()
+        for token in (stripped, first_line):
+            if len(token) == 1:
+                idx = _choice_to_index(token.upper())
+                if idx is not None:
+                    return idx
+
+    normalized = stripped.upper()
     for pattern in (
         r"FINAL ANSWER\s*:\s*\(?\s*([A-E1-5])\s*\)?",
         r"(?:ANSWER|CHOICE|OPTION)\s*[:\s]\s*\(?\s*([A-E1-5])\s*\)?",
     ):
         matches = re.findall(pattern, normalized)
         if matches:
-            choice = matches[-1]
-            if choice in LETTER_TO_INDEX:
-                return LETTER_TO_INDEX[choice]
-            return DIGIT_TO_INDEX[choice]
+            idx = _choice_to_index(matches[-1])
+            if idx is not None:
+                return idx
 
     standalone = re.findall(r"(?m)^\s*\(?\s*([A-E1-5])\s*\)?\s*$", normalized)
     if standalone:
-        choice = standalone[-1]
-        if choice in LETTER_TO_INDEX:
-            return LETTER_TO_INDEX[choice]
-        return DIGIT_TO_INDEX[choice]
+        return _choice_to_index(standalone[-1])
 
     return None
+
+
+def _predicted_id_from_response_text(response_text: str) -> int | None:
+    parsed = _parse_answer_json(response_text)
+    if parsed is not None:
+        return parsed
+    return _parse_answer(response_text)
 
 
 async def answer_question(
@@ -206,12 +243,12 @@ async def answer_question(
         response = await client.aio.models.generate_content(
             model=model,
             contents=contents,
-            config=GEMINI_GENERATE_CONTENT_CONFIG,
+            config=GEMINI_QA_GENERATE_CONTENT_CONFIG,
         )
 
     raw_text, raw_thoughts = split_main_and_thought_texts(response)
     usage = TokenUsage.from_response(response)
-    predicted_id = _parse_answer(raw_text)
+    predicted_id = _predicted_id_from_response_text(raw_text)
 
     save_answer_cache(ck, {
         "predicted_id": predicted_id,

@@ -24,6 +24,39 @@ class Policy(Enum):
     MIXED = "mixed"
 
 
+# Phase 1 pre-build in main: one `materialize_video(..., policy)` per (video, policy) here.
+PHASE1_PREBUILD_POLICIES: tuple[Policy, ...] = (
+    Policy.TRANSCRIPT,
+    Policy.MIXED,
+    Policy.VISUAL_DESCRIPTION,
+    Policy.SUMMARY,
+)
+
+
+def prebuild_gemini_call_count(policy: Policy, n_segments: int) -> int:
+    """
+    Count of Gemini builder invocations (each triggers one progress tick, including cache hits).
+    Must match `materialize_video` for the same policy and segment count.
+    """
+    if policy in (Policy.RAW, Policy.LOW_FPS, Policy.LOW_RES):
+        return 0
+    if policy in (Policy.VISUAL_DESCRIPTION, Policy.SUMMARY):
+        return 1
+    if policy == Policy.TRANSCRIPT:
+        return n_segments
+    if policy == Policy.MIXED:
+        return 2 * n_segments
+    raise ValueError(f"Unhandled policy for prebuild count: {policy}")
+
+
+def phase1_prebuild_total_calls(video_segments: dict[str, list]) -> int:
+    """Total builder calls for Phase 1 over all videos."""
+    return sum(
+        sum(prebuild_gemini_call_count(p, len(segs)) for p in PHASE1_PREBUILD_POLICIES)
+        for segs in video_segments.values()
+    )
+
+
 @dataclass
 class SegmentMaterial:
     text: str | None       # materialized text (None for video-based segments)
@@ -42,7 +75,7 @@ def _pick_mixed_material(
     if _word_count(transcript) > SPEECH_DENSE_WORD_THRESHOLD:
         return SegmentMaterial(text=transcript, material_type="transcript")
     if _word_count(transcript) > 0 or _word_count(summary) > VISUALLY_ACTIVE_WORD_THRESHOLD:
-        return SegmentMaterial(text=None, material_type="low-res", is_video=True)
+        return SegmentMaterial(text=None, material_type="low-fps", is_video=True)
     return SegmentMaterial(text=summary, material_type="summary")
 
 

@@ -11,6 +11,11 @@ def _load_duration_cache() -> dict[str, float]:
     return {}
 
 
+def read_duration_cache() -> dict[str, float]:
+    """Cached durations only; no network. Used for tie-breaking video selection."""
+    return _load_duration_cache()
+
+
 def _save_duration_cache(cache: dict[str, float]) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     DURATIONS_CACHE.write_text(json.dumps(cache, indent=2))

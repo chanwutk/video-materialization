@@ -1,6 +1,6 @@
 from pathlib import Path
 
-MODEL_NAME = "gemini-3-flash-preview"
+MODEL_NAME = "gemini-3.1-pro-preview"
 SEGMENT_LENGTH_S = 30
 TOP_K_VIDEOS = 20
 # Over-select candidates to handle unavailable videos
