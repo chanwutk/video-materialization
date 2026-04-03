@@ -35,6 +35,73 @@ The project compares several query-independent policies rather than learning a p
 - sampled keyframes
 - short summary
 
+## Prompt construction
+
+### Build phase (materialization)
+
+Each policy pre-computes materials by calling Gemini with a segment or whole-video Part plus a task prompt. RAW, LOW_FPS, and LOW_RES skip the build phase entirely.
+
+| Policy | Scope | Build prompt |
+|---|---|---|
+| `transcript` | per segment | "Transcribe all speech in this video segment verbatim. If there is no speech, respond with [NO SPEECH]." |
+| `visual-description` | whole video | "Describe the key visual scenes in this video in chronological order. For each distinct scene, provide a one-sentence description of what is shown." |
+| `summary` | whole video | "Provide a concise summary of this video covering both visual content and any speech." |
+| `mixed` | per segment | Both transcript and per-segment summary prompts run concurrently; routing decides which to use. Per-segment summary prompt: "Provide a concise summary of this video segment in 2-3 sentences, covering both visual content and any speech." |
+
+**Mixed routing rule** (thresholds in `config.py`):
+1. transcript word count > 30 → use transcript text
+2. transcript word count > 0 OR summary word count > 50 → use low-res video clip
+3. otherwise → use summary text
+
+### Query phase (prompt construction)
+
+All policies append the same question block:
+```
+You will be given a question about a video and five possible answer options.
+Question: <question>
+Possible answer choices:
+1) <choice 0>  2) <choice 1>  3) <choice 2>  4) <choice 3>  5) <choice 4>
+
+Output the final answer in the format "Final Answer: (X)" where X is the correct digit choice.
+Do not output any explanation or the full answer text.
+```
+
+**RAW:** `[whole video Part] + [question text]`
+
+**LOW_FPS:** `[whole video Part @ 0.2 fps] + [question text]`
+
+**LOW_RES:** `[whole video Part @ MEDIA_RESOLUTION_LOW] + [question text]`
+
+**VISUAL_DESCRIPTION / SUMMARY** (text-only, single Part):
+```
+[MATERIALIZATION_PREAMBLE]
+[visual-description OR summary]: <built text>
+
+[question text]
+```
+
+**TRANSCRIPT** (text-only, segmented):
+```
+[MATERIALIZATION_PREAMBLE]
+Segment 0 (0s-30s) [transcript]: <text>
+Segment 1 (30s-60s) [transcript]: <text>
+...
+
+[question text]
+```
+
+**MIXED** (multimodal Parts list — text or video clip per segment):
+```
+[MATERIALIZATION_PREAMBLE text Part]
+Segment 0 (0s-30s) [transcript]: <text>          ← text Part
+Segment 1 (30s-60s) [low-res]:                   ← label text Part + low-res video clip Part
+Segment 2 (60s-90s) [summary]: <text>            ← text Part
+...
+[question text Part]
+```
+
+The `MATERIALIZATION_PREAMBLE` (defined in `runner.py`) explains each material type label to the model so it interprets each piece of context correctly.
+
 ## Policy family
 
 - Raw baseline

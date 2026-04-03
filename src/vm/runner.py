@@ -13,6 +13,8 @@ from .tokens import TokenUsage
 
 
 LETTER_TO_INDEX = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4}
+DIGIT_TO_INDEX = {"1": 0, "2": 1, "3": 2, "4": 3, "5": 4}
+ANSWER_PROMPT_CACHE_VERSION = "minerva-direct-v1"
 
 MATERIALIZATION_PREAMBLE = """\
 Below is pre-computed context for a video.
@@ -30,13 +32,22 @@ Use the type labels to interpret each piece of context appropriately.
 def _build_question_text(entry: dict) -> str:
     q = entry["question"]
     choices = [
-        f"A) {entry['answer_choice_0']}",
-        f"B) {entry['answer_choice_1']}",
-        f"C) {entry['answer_choice_2']}",
-        f"D) {entry['answer_choice_3']}",
-        f"E) {entry['answer_choice_4']}",
+        f"1) {entry['answer_choice_0']}",
+        f"2) {entry['answer_choice_1']}",
+        f"3) {entry['answer_choice_2']}",
+        f"4) {entry['answer_choice_3']}",
+        f"5) {entry['answer_choice_4']}",
     ]
-    return f"Question: {q}\n" + "\n".join(choices) + "\n\nRespond with only the letter of the correct answer."
+    lines = [
+        "You will be given a question about a video and five possible answer options.",
+        f"Question: {q}",
+        "Possible answer choices:",
+        *choices,
+        "",
+        'Output the final answer in the format "Final Answer: (X)" where X is the correct digit choice.',
+        "Do not output any explanation or the full answer text.",
+    ]
+    return "\n".join(lines)
 
 
 def _build_nonsegmented_text_prompt(
@@ -114,9 +125,25 @@ def _build_video_parts(
 
 
 def _parse_answer(response_text: str) -> int | None:
-    match = re.search(r"[A-E]", response_text.strip().upper())
-    if match:
-        return LETTER_TO_INDEX[match.group()]
+    normalized = response_text.strip().upper()
+    for pattern in (
+        r"FINAL ANSWER\s*:\s*\(?\s*([A-E1-5])\s*\)?",
+        r"(?:ANSWER|CHOICE|OPTION)\s*[:\s]\s*\(?\s*([A-E1-5])\s*\)?",
+    ):
+        matches = re.findall(pattern, normalized)
+        if matches:
+            choice = matches[-1]
+            if choice in LETTER_TO_INDEX:
+                return LETTER_TO_INDEX[choice]
+            return DIGIT_TO_INDEX[choice]
+
+    standalone = re.findall(r"(?m)^\s*\(?\s*([A-E1-5])\s*\)?\s*$", normalized)
+    if standalone:
+        choice = standalone[-1]
+        if choice in LETTER_TO_INDEX:
+            return LETTER_TO_INDEX[choice]
+        return DIGIT_TO_INDEX[choice]
+
     return None
 
 
@@ -135,7 +162,12 @@ async def answer_question(
     """
     Answer a single question asynchronously.
     """
-    ck = answer_cache_key(video_id, policy.value, entry["key"])
+    # Keep prompt changes from silently reusing cached answers from older formats.
+    ck = answer_cache_key(
+        video_id,
+        f"{policy.value}_{ANSWER_PROMPT_CACHE_VERSION}",
+        entry["key"],
+    )
     cached = load_answer_cache(ck)
     if cached:
         if pbar: pbar.update(1)
