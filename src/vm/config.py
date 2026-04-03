@@ -26,3 +26,6 @@ VISUALLY_ACTIVE_WORD_THRESHOLD = 50
 
 # Low-FPS policy
 LOW_FPS_RATE = 0.2
+
+# Low-resolution policy (~64 tokens per frame)
+LOW_RES_MEDIA_RESOLUTION = "MEDIA_RESOLUTION_LOW"

@@ -1,11 +1,12 @@
+import asyncio
 import re
-import time
+from typing import Any
 
 from google import genai
 from google.genai import types
 
 from .cache import answer_cache_key, load_answer_cache, save_answer_cache
-from .config import API_CALL_DELAY_S, LOW_FPS_RATE, MODEL_NAME
+from .config import LOW_FPS_RATE, LOW_RES_MEDIA_RESOLUTION, MODEL_NAME
 from .policies import Policy, SegmentMaterial
 from .segmenter import Segment
 from .tokens import TokenUsage
@@ -20,6 +21,7 @@ Each piece of context is labeled with its materialization type:
 - [visual-description]: Descriptions of key visual scenes and actions.
 - [summary]: A brief combined overview of both visual and audio content.
 - [low-fps]: A low-frame-rate video clip of the segment (visual only).
+- [low-res]: A low-resolution video clip of the segment.
 
 Use the type labels to interpret each piece of context appropriately.
 """
@@ -41,7 +43,6 @@ def _build_nonsegmented_text_prompt(
     material: SegmentMaterial,
     entry: dict,
 ) -> str:
-    """Prompt for non-segmented text policies (visual-description, summary)."""
     return (
         MATERIALIZATION_PREAMBLE + "\n"
         f"[{material.material_type}]: {material.text}\n\n"
@@ -54,7 +55,6 @@ def _build_segmented_text_prompt(
     segments: list[Segment],
     entry: dict,
 ) -> str:
-    """Prompt for segmented text-only policies (transcript)."""
     lines = [MATERIALIZATION_PREAMBLE]
     for seg in segments:
         mat = materialized[seg.index]
@@ -70,20 +70,27 @@ def _build_mixed_parts(
     youtube_url: str,
     entry: dict,
 ) -> list[types.Part]:
-    """Build Parts list for mixed policy (interleaving text and video)."""
     parts = [types.Part(text=MATERIALIZATION_PREAMBLE)]
     for seg in segments:
         mat = materialized[seg.index]
         if mat.is_video:
             parts.append(types.Part(text=f"Segment {seg.index} ({seg.start_s}s-{seg.end_s}s) [{mat.material_type}]:"))
-            parts.append(types.Part(
-                file_data=types.FileData(file_uri=youtube_url),
-                video_metadata=types.VideoMetadata(
+            part_kwargs: dict = {
+                "file_data": types.FileData(file_uri=youtube_url),
+                "video_metadata": types.VideoMetadata(
+                    start_offset=f"{seg.start_s}s",
+                    end_offset=f"{seg.end_s}s",
+                ),
+            }
+            if mat.material_type == "low-res":
+                part_kwargs["media_resolution"] = types.PartMediaResolution(level=LOW_RES_MEDIA_RESOLUTION)
+            elif mat.material_type == "low-fps":
+                part_kwargs["video_metadata"] = types.VideoMetadata(
                     start_offset=f"{seg.start_s}s",
                     end_offset=f"{seg.end_s}s",
                     fps=LOW_FPS_RATE,
-                ),
-            ))
+                )
+            parts.append(types.Part(**part_kwargs))
         else:
             parts.append(types.Part(
                 text=f"Segment {seg.index} ({seg.start_s}s-{seg.end_s}s) [{mat.material_type}]: {mat.text}"
@@ -96,17 +103,14 @@ def _build_video_parts(
     youtube_url: str,
     entry: dict,
     fps: float | None = None,
+    media_resolution: str | None = None,
 ) -> list[types.Part]:
-    """Build Parts for raw or low-fps policy (full video, single Part)."""
-    video_metadata = types.VideoMetadata(fps=fps) if fps else None
-    parts = [
-        types.Part(
-            file_data=types.FileData(file_uri=youtube_url),
-            video_metadata=video_metadata,
-        ),
-        types.Part(text=_build_question_text(entry)),
-    ]
-    return parts
+    part_kwargs: dict = {"file_data": types.FileData(file_uri=youtube_url)}
+    if fps:
+        part_kwargs["video_metadata"] = types.VideoMetadata(fps=fps)
+    if media_resolution:
+        part_kwargs["media_resolution"] = types.PartMediaResolution(level=media_resolution)
+    return [types.Part(**part_kwargs), types.Part(text=_build_question_text(entry))]
 
 
 def _parse_answer(response_text: str) -> int | None:
@@ -116,7 +120,7 @@ def _parse_answer(response_text: str) -> int | None:
     return None
 
 
-def answer_question(
+async def answer_question(
     client: genai.Client,
     policy: Policy,
     youtube_url: str,
@@ -124,54 +128,45 @@ def answer_question(
     segments: list[Segment],
     materialized: dict[int, SegmentMaterial],
     entry: dict,
+    sem: asyncio.Semaphore,
     model: str = MODEL_NAME,
+    pbar: Any = None,
 ) -> tuple[int | None, str, TokenUsage]:
     """
-    Answer a single question.
-
-    Returns: (predicted_id, raw_response_text, token_usage)
+    Answer a single question asynchronously.
     """
     ck = answer_cache_key(video_id, policy.value, entry["key"])
     cached = load_answer_cache(ck)
     if cached:
+        if pbar: pbar.update(1)
         return cached["predicted_id"], cached["raw_response"], TokenUsage.from_dict(cached["usage"])
 
     if policy == Policy.RAW:
         parts = _build_video_parts(youtube_url, entry)
-        response = client.models.generate_content(
-            model=model,
-            contents=types.Content(parts=parts),
-        )
+        contents = types.Content(parts=parts)
     elif policy == Policy.LOW_FPS:
         parts = _build_video_parts(youtube_url, entry, fps=LOW_FPS_RATE)
-        response = client.models.generate_content(
-            model=model,
-            contents=types.Content(parts=parts),
-        )
+        contents = types.Content(parts=parts)
+    elif policy == Policy.LOW_RES:
+        parts = _build_video_parts(youtube_url, entry, media_resolution=LOW_RES_MEDIA_RESOLUTION)
+        contents = types.Content(parts=parts)
     elif policy in (Policy.VISUAL_DESCRIPTION, Policy.SUMMARY):
-        # Non-segmented text
         prompt = _build_nonsegmented_text_prompt(materialized[0], entry)
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-        )
+        contents = prompt
     elif policy == Policy.TRANSCRIPT:
-        # Segmented text
         prompt = _build_segmented_text_prompt(materialized, segments, entry)
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-        )
+        contents = prompt
     elif policy == Policy.MIXED:
         parts = _build_mixed_parts(materialized, segments, youtube_url, entry)
-        response = client.models.generate_content(
-            model=model,
-            contents=types.Content(parts=parts),
-        )
+        contents = types.Content(parts=parts)
     else:
         raise ValueError(f"Unknown policy: {policy}")
 
-    time.sleep(API_CALL_DELAY_S)
+    async with sem:
+        response = await client.aio.models.generate_content(
+            model=model,
+            contents=contents,
+        )
 
     raw_text = response.text
     usage = TokenUsage.from_response(response)
@@ -183,4 +178,5 @@ def answer_question(
         "usage": usage.to_dict(),
     })
 
+    if pbar: pbar.update(1)
     return predicted_id, raw_text, usage
