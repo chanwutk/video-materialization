@@ -7,6 +7,8 @@ from google.genai import types
 
 from .cache import answer_cache_key, load_answer_cache, save_answer_cache
 from .config import LOW_FPS_RATE, LOW_RES_MEDIA_RESOLUTION, MODEL_NAME
+from .genai_config import GEMINI_GENERATE_CONTENT_CONFIG
+from .genai_response import split_main_and_thought_texts
 from .policies import Policy, SegmentMaterial
 from .segmenter import Segment
 from .tokens import TokenUsage
@@ -14,7 +16,7 @@ from .tokens import TokenUsage
 
 LETTER_TO_INDEX = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4}
 DIGIT_TO_INDEX = {"1": 0, "2": 1, "3": 2, "4": 3, "5": 4}
-ANSWER_PROMPT_CACHE_VERSION = "minerva-direct-v1"
+ANSWER_PROMPT_CACHE_VERSION = "minerva-direct-v2"
 
 MATERIALIZATION_PREAMBLE = """\
 Below is pre-computed context for a video.
@@ -158,9 +160,10 @@ async def answer_question(
     sem: asyncio.Semaphore,
     model: str = MODEL_NAME,
     pbar: Any = None,
-) -> tuple[int | None, str, TokenUsage]:
+) -> tuple[int | None, str, str, TokenUsage]:
     """
     Answer a single question asynchronously.
+    Returns (predicted_id, raw_response, raw_thoughts, usage).
     """
     # Keep prompt changes from silently reusing cached answers from older formats.
     ck = answer_cache_key(
@@ -171,7 +174,12 @@ async def answer_question(
     cached = load_answer_cache(ck)
     if cached:
         if pbar: pbar.update(1)
-        return cached["predicted_id"], cached["raw_response"], TokenUsage.from_dict(cached["usage"])
+        return (
+            cached["predicted_id"],
+            cached["raw_response"],
+            cached.get("raw_thoughts", ""),
+            TokenUsage.from_dict(cached["usage"]),
+        )
 
     if policy == Policy.RAW:
         parts = _build_video_parts(youtube_url, entry)
@@ -198,17 +206,19 @@ async def answer_question(
         response = await client.aio.models.generate_content(
             model=model,
             contents=contents,
+            config=GEMINI_GENERATE_CONTENT_CONFIG,
         )
 
-    raw_text = response.text
+    raw_text, raw_thoughts = split_main_and_thought_texts(response)
     usage = TokenUsage.from_response(response)
     predicted_id = _parse_answer(raw_text)
 
     save_answer_cache(ck, {
         "predicted_id": predicted_id,
         "raw_response": raw_text,
+        "raw_thoughts": raw_thoughts,
         "usage": usage.to_dict(),
     })
 
     if pbar: pbar.update(1)
-    return predicted_id, raw_text, usage
+    return predicted_id, raw_text, raw_thoughts, usage

@@ -9,6 +9,8 @@ from .cache import (
     load_builder_cache, save_builder_cache,
 )
 from .config import MODEL_NAME
+from .genai_config import GEMINI_GENERATE_CONTENT_CONFIG
+from .genai_response import split_main_and_thought_texts
 from .segmenter import Segment
 from .tokens import TokenUsage
 
@@ -35,14 +37,16 @@ async def _call_gemini(
     prompt: str,
     sem: asyncio.Semaphore,
     model: str = MODEL_NAME,
-) -> tuple[str, TokenUsage]:
+) -> tuple[str, TokenUsage, str]:
     text_part = types.Part(text=prompt)
     async with sem:
         response = await client.aio.models.generate_content(
             model=model,
             contents=types.Content(parts=[video_part, text_part]),
+            config=GEMINI_GENERATE_CONTENT_CONFIG,
         )
-    return response.text, TokenUsage.from_response(response)
+    main_text, thoughts_text = split_main_and_thought_texts(response)
+    return main_text, TokenUsage.from_response(response), thoughts_text
 
 
 # --- Per-segment builders (used by transcript policy and mixed policy) ---
@@ -58,12 +62,12 @@ async def build_transcript(
         return cached["text"], TokenUsage.from_dict(cached["usage"])
 
     video_part = _make_segment_video_part(youtube_url, segment)
-    text, usage = await _call_gemini(
+    text, usage, thoughts = await _call_gemini(
         client, video_part,
         "Transcribe all speech in this video segment verbatim. If there is no speech, respond with [NO SPEECH].",
         sem, model=model,
     )
-    save_builder_cache(key, {"text": text, "usage": usage.to_dict()})
+    save_builder_cache(key, {"text": text, "thoughts": thoughts, "usage": usage.to_dict()})
     if pbar: pbar.update(1)
     return text, usage
 
@@ -80,12 +84,12 @@ async def build_segment_summary(
         return cached["text"], TokenUsage.from_dict(cached["usage"])
 
     video_part = _make_segment_video_part(youtube_url, segment)
-    text, usage = await _call_gemini(
+    text, usage, thoughts = await _call_gemini(
         client, video_part,
         "Provide a concise summary of this video segment in 2-3 sentences, covering both visual content and any speech.",
         sem, model=model,
     )
-    save_builder_cache(key, {"text": text, "usage": usage.to_dict()})
+    save_builder_cache(key, {"text": text, "thoughts": thoughts, "usage": usage.to_dict()})
     if pbar: pbar.update(1)
     return text, usage
 
@@ -103,12 +107,12 @@ async def build_visual_description(
         return cached["text"], TokenUsage.from_dict(cached["usage"])
 
     video_part = _make_whole_video_part(youtube_url)
-    text, usage = await _call_gemini(
+    text, usage, thoughts = await _call_gemini(
         client, video_part,
         "Describe the key visual scenes in this video in chronological order. For each distinct scene, provide a one-sentence description of what is shown.",
         sem, model=model,
     )
-    save_builder_cache(key, {"text": text, "usage": usage.to_dict()})
+    save_builder_cache(key, {"text": text, "thoughts": thoughts, "usage": usage.to_dict()})
     if pbar: pbar.update(1)
     return text, usage
 
@@ -124,11 +128,11 @@ async def build_whole_summary(
         return cached["text"], TokenUsage.from_dict(cached["usage"])
 
     video_part = _make_whole_video_part(youtube_url)
-    text, usage = await _call_gemini(
+    text, usage, thoughts = await _call_gemini(
         client, video_part,
         "Provide a concise summary of this video covering both visual content and any speech.",
         sem, model=model,
     )
-    save_builder_cache(key, {"text": text, "usage": usage.to_dict()})
+    save_builder_cache(key, {"text": text, "thoughts": thoughts, "usage": usage.to_dict()})
     if pbar: pbar.update(1)
     return text, usage

@@ -3,6 +3,9 @@ from pathlib import Path
 
 from .config import BUILDERS_CACHE_DIR, ANSWERS_CACHE_DIR
 
+# Bump when builder cache payload shape changes (e.g. adding thoughts text).
+BUILDER_CACHE_REVISION = "thoughtsv1"
+
 
 def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
@@ -10,12 +13,12 @@ def _ensure_dir(path: Path) -> None:
 
 def cache_key(video_id: str, segment_index: int, builder_type: str) -> str:
     safe_id = video_id.replace("/", "_").replace("\\", "_")
-    return f"{safe_id}_seg{segment_index:02d}_{builder_type}"
+    return f"{safe_id}_seg{segment_index:02d}_{builder_type}_{BUILDER_CACHE_REVISION}"
 
 
 def whole_video_cache_key(video_id: str, builder_type: str) -> str:
     safe_id = video_id.replace("/", "_").replace("\\", "_")
-    return f"{safe_id}_whole_{builder_type}"
+    return f"{safe_id}_whole_{builder_type}_{BUILDER_CACHE_REVISION}"
 
 
 def load_builder_cache(key: str) -> dict | None:

@@ -210,7 +210,9 @@ async def run_experiment_async(args):
 
             query_results = await asyncio.gather(*query_tasks)
 
-        for (vid, entry, token_log), (predicted_id, raw_response, usage) in zip(task_meta, query_results):
+        for (vid, entry, token_log), (predicted_id, raw_response, raw_thoughts, usage) in zip(
+            task_meta, query_results,
+        ):
             token_log.query_usage.append(usage)
             all_results[policy.value].append({
                 "video_id": vid,
@@ -219,6 +221,7 @@ async def run_experiment_async(args):
                 "answer_id": entry["answer_id"],
                 "policy": policy.value,
                 "raw_response": raw_response,
+                "raw_thoughts": raw_thoughts,
             })
 
     # Phase 3: Evaluate and output
