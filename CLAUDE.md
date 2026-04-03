@@ -27,3 +27,8 @@ Research project investigating how static segment-level materialization policies
 - Token accounting separates build-time vs query-time costs
 - Embeddings are out of scope
 - See PLAN.md for full experiment plans and implementation checklist
+
+## Plan
+Experimental research project investigating how static segment-level materialization policies trade off token usage and answer accuracy for repeated-query video QA workloads. This is an experimentation codebase — prioritize quick iteration and getting results over production-quality code.
+
+See [PLAN.md](PLAN.md) for detailed experiment plans, design decisions, and implementation checklist.
