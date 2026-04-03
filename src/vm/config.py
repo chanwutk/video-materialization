@@ -25,5 +25,10 @@ VISUALLY_ACTIVE_WORD_THRESHOLD = 50
 # Low-FPS policy
 LOW_FPS_RATE = 0.2
 
+# Mixed low-fps: probe duration can exceed YouTube's decodable end; clip offsets down.
+VIDEO_DURATION_CLIP_SLACK_S = 2
+# Below ~one frame at 0.2 fps (5s); use text instead of a video Part.
+MIN_SEGMENT_S_FOR_MIXED_LOW_FPS = 6
+
 # Low-resolution policy (~64 tokens per frame)
 LOW_RES_MEDIA_RESOLUTION = "MEDIA_RESOLUTION_LOW"

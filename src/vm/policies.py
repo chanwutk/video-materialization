@@ -9,7 +9,12 @@ from .builders import (
     build_transcript, build_segment_summary,
     build_visual_description, build_whole_summary,
 )
-from .config import SPEECH_DENSE_WORD_THRESHOLD, VISUALLY_ACTIVE_WORD_THRESHOLD, MODEL_NAME
+from .config import (
+    MIN_SEGMENT_S_FOR_MIXED_LOW_FPS,
+    SPEECH_DENSE_WORD_THRESHOLD,
+    VISUALLY_ACTIVE_WORD_THRESHOLD,
+    MODEL_NAME,
+)
 from .segmenter import Segment
 from .tokens import TokenUsage
 
@@ -69,12 +74,17 @@ def _word_count(text: str) -> int:
 
 
 def _pick_mixed_material(
-    transcript: str, summary: str,
+    transcript: str, summary: str, seg: Segment,
 ) -> SegmentMaterial:
     """Route a segment for the mixed policy (3 tiers)."""
     if _word_count(transcript) > SPEECH_DENSE_WORD_THRESHOLD:
         return SegmentMaterial(text=transcript, material_type="transcript")
     if _word_count(transcript) > 0 or _word_count(summary) > VISUALLY_ACTIVE_WORD_THRESHOLD:
+        duration = seg.end_s - seg.start_s
+        if duration < MIN_SEGMENT_S_FOR_MIXED_LOW_FPS:
+            if _word_count(transcript) > 0:
+                return SegmentMaterial(text=transcript, material_type="transcript")
+            return SegmentMaterial(text=summary, material_type="summary")
         return SegmentMaterial(text=None, material_type="low-fps", is_video=True)
     return SegmentMaterial(text=summary, material_type="summary")
 
@@ -146,7 +156,7 @@ async def materialize_video(
 
         for seg, (t_text, t_usage), (s_text, s_usage) in zip(segments, transcript_results, summary_results):
             build_usages.extend([t_usage, s_usage])
-            materialized[seg.index] = _pick_mixed_material(t_text, s_text)
+            materialized[seg.index] = _pick_mixed_material(t_text, s_text, seg)
         return materialized, build_usages
 
     raise ValueError(f"Unknown policy: {policy}")

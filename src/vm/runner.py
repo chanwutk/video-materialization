@@ -29,7 +29,7 @@ from .tokens import TokenUsage
 
 LETTER_TO_INDEX = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4}
 DIGIT_TO_INDEX = {"1": 0, "2": 1, "3": 2, "4": 3, "5": 4}
-ANSWER_PROMPT_CACHE_VERSION = "minerva-json-schema-v1"
+ANSWER_PROMPT_CACHE_VERSION = "minerva-json-schema-v2"
 
 MATERIALIZATION_PREAMBLE = """\
 Below is pre-computed context for a video.
@@ -90,11 +90,48 @@ def _build_segmented_text_prompt(
     return "\n".join(lines)
 
 
+def _mixed_clip_bounds(
+    seg: Segment, video_duration_s: float | None,
+) -> tuple[int, int] | None:
+    """
+    Shrink [start,end) so end does not exceed a conservative stream length.
+    Cached duration often rounds up vs what YouTube/Gemini can decode →
+    INVALID_ARGUMENT / no frames when the window is past the real end.
+    """
+    start, end = seg.start_s, seg.end_s
+    if end <= start:
+        return None
+    if video_duration_s is None:
+        return start, end
+    safe_upper = int(video_duration_s) - VIDEO_DURATION_CLIP_SLACK_S
+    clip_end = min(end, safe_upper)
+    if clip_end <= start:
+        return None
+    return start, clip_end
+
+
+def _effective_low_fps_for_duration(duration_s: float) -> float:
+    """Stay within (0, 24] fps; target enough samples for short clips."""
+    d = max(float(duration_s), 1e-6)
+    need = max(LOW_FPS_RATE, 2.0 / d)
+    return min(24.0, need)
+
+
+def _mixed_segment_fallback_text(video_id: str, segment_index: int) -> str:
+    for kind in ("summary", "transcript"):
+        cached = load_builder_cache(cache_key(video_id, segment_index, kind))
+        if cached and cached.get("text"):
+            return str(cached["text"])
+    return "[NO SEGMENT CONTEXT]"
+
+
 def _build_mixed_parts(
     materialized: dict[int, SegmentMaterial],
     segments: list[Segment],
     youtube_url: str,
     entry: dict,
+    video_id: str,
+    video_duration_s: float | None,
 ) -> list[types.Part]:
     parts = [types.Part(text=MATERIALIZATION_PREAMBLE)]
     for seg in segments:
@@ -117,7 +154,31 @@ def _build_mixed_parts(
                     end_offset=f"{seg.end_s}s",
                     fps=_effective_low_fps(span),
                 )
-            parts.append(types.Part(**part_kwargs))
+                if (c_start, c_end) != (seg.start_s, seg.end_s):
+                    label += f" (clipped from {seg.start_s}s-{seg.end_s}s)"
+                parts.append(types.Part(text=f"{label}:"))
+                parts.append(types.Part(
+                    file_data=types.FileData(file_uri=youtube_url),
+                    video_metadata=types.VideoMetadata(
+                        start_offset=f"{c_start}s",
+                        end_offset=f"{c_end}s",
+                        fps=_effective_low_fps_for_duration(dur),
+                    ),
+                ))
+            elif mat.material_type == "low-res":
+                parts.append(types.Part(
+                    text=f"Segment {seg.index} ({seg.start_s}s-{seg.end_s}s) [{mat.material_type}]:",
+                ))
+                parts.append(types.Part(
+                    file_data=types.FileData(file_uri=youtube_url),
+                    video_metadata=types.VideoMetadata(
+                        start_offset=f"{seg.start_s}s",
+                        end_offset=f"{seg.end_s}s",
+                    ),
+                    media_resolution=types.PartMediaResolution(level=LOW_RES_MEDIA_RESOLUTION),
+                ))
+            else:
+                raise ValueError(f"Unknown mixed video material_type: {mat.material_type}")
         else:
             parts.append(types.Part(
                 text=f"Segment {seg.index} ({seg.start_s}s-{seg.end_s}s) [{mat.material_type}]: {mat.text}"
@@ -253,7 +314,9 @@ async def answer_question(
         prompt = _build_segmented_text_prompt(materialized, segments, entry)
         contents = prompt
     elif policy == Policy.MIXED:
-        parts = _build_mixed_parts(materialized, segments, youtube_url, entry)
+        parts = _build_mixed_parts(
+            materialized, segments, youtube_url, entry, video_id, video_duration_s,
+        )
         contents = types.Content(parts=parts)
     else:
         raise ValueError(f"Unknown policy: {policy}")
