@@ -31,7 +31,7 @@ from .policies import (
 )
 from .runner import answer_question
 from .segmenter import segment_video
-from .tokens import PolicyTokenLog
+from .tokens import PolicyTokenLog, TokenUsage
 
 ALL_POLICIES = "raw,transcript,visual-description,summary,low-fps,mixed"
 DEFAULT_CONCURRENCY = 16
@@ -301,6 +301,14 @@ async def run_experiment_async(args):
         query_output = sum(sum(u.candidates_tokens for u in log.query_usage) for log in logs)
         query_thoughts = sum(sum(u.thoughts_tokens for u in log.query_usage) for log in logs)
 
+        build_usages_flat: list[TokenUsage] = []
+        query_usages_flat: list[TokenUsage] = []
+        for log in logs:
+            build_usages_flat.extend(log.build_usage)
+            query_usages_flat.extend(log.query_usage)
+        build_lat_s, build_n_api, build_mean_s = _latency_stats(build_usages_flat)
+        query_lat_s, query_n_api, query_mean_s = _latency_stats(query_usages_flat)
+
         row = {
             "policy": policy.value,
             "accuracy": eval_result["accuracy"],
@@ -316,6 +324,12 @@ async def run_experiment_async(args):
             "query_thoughts_tokens": query_thoughts,
             "query_total_tokens": total_query,
             "total_tokens": total,
+            "build_api_latency_s_sum": build_lat_s,
+            "build_api_calls_live": build_n_api,
+            "build_api_latency_mean_s": build_mean_s,
+            "query_api_latency_s_sum": query_lat_s,
+            "query_api_calls_live": query_n_api,
+            "query_api_latency_mean_s": query_mean_s,
         }
         summary_rows.append(row)
 
@@ -325,6 +339,14 @@ async def run_experiment_async(args):
         print(f"  Build tokens: {total_build:,}")
         print(f"  Query tokens: {total_query:,}")
         print(f"  Total tokens: {total:,}")
+        print(
+            f"  Build API latency: {build_lat_s:.1f}s sum over {build_n_api} calls "
+            f"(mean {build_mean_s:.2f}s)"
+        )
+        print(
+            f"  Query API latency: {query_lat_s:.1f}s sum over {query_n_api} calls "
+            f"(mean {query_mean_s:.2f}s)"
+        )
 
     # Save token breakdown table
     df = pd.DataFrame(summary_rows)

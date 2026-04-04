@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import time
 from typing import Any
 
 from google import genai
@@ -322,14 +323,16 @@ async def answer_question(
         raise ValueError(f"Unknown policy: {policy}")
 
     async with sem:
+        t0 = time.monotonic()
         response = await client.aio.models.generate_content(
             model=model,
             contents=contents,
             config=GEMINI_QA_GENERATE_CONTENT_CONFIG,
         )
+        latency_s = time.monotonic() - t0
 
     raw_text, raw_thoughts = split_main_and_thought_texts(response)
-    usage = TokenUsage.from_response(response)
+    usage = TokenUsage.from_response(response, latency_s=latency_s)
     predicted_id = _predicted_id_from_response_text(raw_text)
 
     save_answer_cache(ck, {

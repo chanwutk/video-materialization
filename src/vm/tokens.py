@@ -7,15 +7,18 @@ class TokenUsage:
     candidates_tokens: int = 0
     total_tokens: int = 0
     thoughts_tokens: int = 0
+    # Wall time for the generate_content await (0 when served from cache).
+    latency_s: float = 0.0
 
     @classmethod
-    def from_response(cls, response) -> "TokenUsage":
+    def from_response(cls, response, *, latency_s: float = 0.0) -> "TokenUsage":
         m = response.usage_metadata
         return cls(
             prompt_tokens=m.prompt_token_count or 0,
             candidates_tokens=m.candidates_token_count or 0,
             total_tokens=m.total_token_count or 0,
             thoughts_tokens=getattr(m, "thoughts_token_count", 0) or 0,
+            latency_s=latency_s,
         )
 
     def to_dict(self) -> dict:
@@ -24,11 +27,18 @@ class TokenUsage:
             "candidates_tokens": self.candidates_tokens,
             "total_tokens": self.total_tokens,
             "thoughts_tokens": self.thoughts_tokens,
+            "latency_s": self.latency_s,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "TokenUsage":
-        return cls(**d)
+        return cls(
+            prompt_tokens=d.get("prompt_tokens", 0),
+            candidates_tokens=d.get("candidates_tokens", 0),
+            total_tokens=d.get("total_tokens", 0),
+            thoughts_tokens=d.get("thoughts_tokens", 0),
+            latency_s=float(d.get("latency_s", 0.0)),
+        )
 
 
 @dataclass

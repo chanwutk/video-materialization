@@ -1,4 +1,5 @@
 import asyncio
+import time
 from typing import Any
 
 from google import genai
@@ -40,13 +41,15 @@ async def _call_gemini(
 ) -> tuple[str, TokenUsage, str]:
     text_part = types.Part(text=prompt)
     async with sem:
+        t0 = time.monotonic()
         response = await client.aio.models.generate_content(
             model=model,
             contents=types.Content(parts=[video_part, text_part]),
             config=GEMINI_GENERATE_CONTENT_CONFIG,
         )
+        latency_s = time.monotonic() - t0
     main_text, thoughts_text = split_main_and_thought_texts(response)
-    return main_text, TokenUsage.from_response(response), thoughts_text
+    return main_text, TokenUsage.from_response(response, latency_s=latency_s), thoughts_text
 
 
 # --- Per-segment builders (used by transcript policy and mixed policy) ---
