@@ -3,7 +3,7 @@ import asyncio
 import json
 from dataclasses import dataclass
 
-import matplotlib.pyplot as plt
+import altair as alt
 import pandas as pd
 from rich.progress import (
     BarColumn,
@@ -15,11 +15,11 @@ from rich.progress import (
 )
 
 from .config import (
-    MODEL_NAME, SEGMENT_LENGTH_S, TOP_K_VIDEOS, TOP_K_CANDIDATES,
+    MODEL_NAME, SEGMENT_LENGTH_S, TOP_K_VIDEOS,
     RESULTS_DIR, DATA_DIR,
 )
 from .dataset import download_minerva, group_by_video, select_top_k
-from .duration import get_durations_for_videos, read_duration_cache
+from .duration import get_durations_for_videos
 from .evaluator import evaluate
 from .policies import (
     PHASE1_PREBUILD_POLICIES,
@@ -34,6 +34,7 @@ from .tokens import PolicyTokenLog
 
 ALL_POLICIES = "raw,transcript,visual-description,summary,low-fps,mixed"
 DEFAULT_CONCURRENCY = 1024
+MAX_VIDEO_DURATION_S = 600
 
 # Description, bar, completed/total, %, ETA.
 _PROGRESS_COLUMNS = (
@@ -72,30 +73,27 @@ def parse_args():
 
 
 def select_videos(top_k: int):
-    """Download dataset, group, select top-K with valid durations."""
+    """Download dataset, group, filter by duration, then select top-K among eligible."""
     entries = download_minerva()
     grouped = group_by_video(entries)
 
-    candidates = select_top_k(
-        grouped, TOP_K_CANDIDATES, duration_hint=read_duration_cache(),
-    )
+    all_ids = list(grouped.keys())
+    print(f"\nFetching durations for {len(all_ids)} videos...")
+    durations = get_durations_for_videos(all_ids)
 
-    print(f"\nFetching durations for {len(candidates)} candidate videos...")
-    durations = get_durations_for_videos(list(candidates.keys()))
-
-    valid_videos = {
-        vid: candidates[vid]
-        for vid in candidates
-        if vid in durations
+    eligible = {
+        vid: grouped[vid]
+        for vid in grouped
+        if vid in durations and durations[vid] <= MAX_VIDEO_DURATION_S
     }
-    sorted_valid = sorted(
-        valid_videos.items(),
-        key=lambda x: (len(x[1]), durations[x[0]]),
-        reverse=True,
+    print(
+        f"  {len(eligible)} videos with known duration <= {MAX_VIDEO_DURATION_S}s "
+        f"(excluded {len(grouped) - len(eligible)} longer or unavailable)",
     )
-    selected = dict(sorted_valid[:top_k])
 
-    print(f"\nFinal selection: {len(selected)} videos with valid durations")
+    selected = select_top_k(eligible, top_k, duration_hint=durations)
+
+    print(f"\nFinal selection: {len(selected)} videos")
     for vid, qs in selected.items():
         print(f"  {vid}: {len(qs)} questions, {durations[vid]:.0f}s duration")
 
@@ -104,6 +102,10 @@ def select_videos(top_k: int):
 
 async def run_experiment_async(args):
     selected, durations = select_videos(args.top_k)
+    # Longest videos first for build and query execution order.
+    ordered_vids = sorted(
+        selected.keys(), key=lambda v: durations[v], reverse=True,
+    )
 
     policies = [Policy(p.strip()) for p in args.policies.split(",")]
     segment_length = args.segment_length
@@ -111,7 +113,7 @@ async def run_experiment_async(args):
 
     # Compute segments for each video
     video_segments = {}
-    for vid in selected:
+    for vid in ordered_vids:
         segs = segment_video(durations[vid], segment_length)
         video_segments[vid] = segs
 
@@ -127,7 +129,8 @@ async def run_experiment_async(args):
         print(f"Total segments: {total_segments}")
         print(f"Total questions: {total_questions}")
         print(f"\nPer-video breakdown:")
-        for vid, segs in video_segments.items():
+        for vid in ordered_vids:
+            segs = video_segments[vid]
             print(f"  {vid}: {len(segs)} segments, {len(selected[vid])} questions")
 
         n_builder_calls = phase1_prebuild_total_calls(video_segments)
@@ -159,7 +162,7 @@ async def run_experiment_async(args):
     with Progress(*_PROGRESS_COLUMNS) as progress:
         task_id = progress.add_task("  Building", total=n_build_calls)
         pbar = Pbar(progress, task_id)
-        for vid in selected:
+        for vid in ordered_vids:
             youtube_url = f"https://www.youtube.com/watch?v={vid}"
             segs = video_segments[vid]
             for policy in PHASE1_PREBUILD_POLICIES:
@@ -182,7 +185,7 @@ async def run_experiment_async(args):
     for policy in policies:
         # Pre-compute materialized data for all videos (all cached from Phase 1)
         video_materials: dict[str, tuple] = {}  # vid -> (materialized, build_usages)
-        for vid in selected:
+        for vid in ordered_vids:
             youtube_url = f"https://www.youtube.com/watch?v={vid}"
             segs = video_segments[vid]
             materialized, build_usages = await materialize_video(
@@ -196,7 +199,7 @@ async def run_experiment_async(args):
         with Progress(*_PROGRESS_COLUMNS) as progress:
             task_id = progress.add_task(f"  {policy.value}", total=total_questions)
             pbar = Pbar(progress, task_id)
-            for vid in selected:
+            for vid in ordered_vids:
                 youtube_url = f"https://www.youtube.com/watch?v={vid}"
                 segs = video_segments[vid]
                 materialized, build_usages = video_materials[vid]
@@ -294,21 +297,42 @@ async def run_experiment_async(args):
     (RESULTS_DIR / "raw_results.json").write_text(json.dumps(raw_output, indent=2))
     print("Saved raw_results.json")
 
-    # Plot tokens vs accuracy
-    fig, ax = plt.subplots(figsize=(8, 6))
-    for row in summary_rows:
-        ax.scatter(row["total_tokens"], row["accuracy"] * 100, s=100, zorder=5)
-        ax.annotate(
-            row["policy"],
-            (row["total_tokens"], row["accuracy"] * 100),
-            textcoords="offset points", xytext=(10, 5), fontsize=11,
+    # Plot tokens vs accuracy (pandas + Altair; no Python loops on rows)
+    plot_df = df.assign(accuracy_pct=df["accuracy"].mul(100))
+    points = (
+        alt.Chart(plot_df)
+        .mark_circle(size=120, opacity=0.95)
+        .encode(
+            x=alt.X("total_tokens:Q", title="Total Tokens (build + query)"),
+            y=alt.Y("accuracy_pct:Q", title="Accuracy (%)"),
+            tooltip=[
+                alt.Tooltip("policy:N", title="Policy"),
+                alt.Tooltip("total_tokens:Q", format=",", title="Total tokens"),
+                alt.Tooltip("accuracy_pct:Q", format=".2f", title="Accuracy (%)"),
+            ],
         )
-    ax.set_xlabel("Total Tokens (build + query)")
-    ax.set_ylabel("Accuracy (%)")
-    ax.set_title("Token Cost vs Accuracy by Policy")
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(RESULTS_DIR / "tokens_vs_accuracy.png", dpi=150)
+    )
+    labels = (
+        alt.Chart(plot_df)
+        .mark_text(dx=10, dy=5, fontSize=11, align="left", baseline="middle")
+        .encode(
+            x="total_tokens:Q",
+            y="accuracy_pct:Q",
+            text="policy:N",
+        )
+    )
+    chart = (
+        (points + labels)
+        .properties(
+            title="Token Cost vs Accuracy by Policy",
+            width=520,
+            height=400,
+        )
+        .configure_axis(grid=True, gridOpacity=0.3)
+        .configure_view(strokeWidth=0)
+    )
+    png_path = RESULTS_DIR / "tokens_vs_accuracy.png"
+    chart.save(str(png_path), scale_factor=2)
     print("Saved tokens_vs_accuracy.png")
 
 
