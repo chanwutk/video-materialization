@@ -1,7 +1,11 @@
 import json
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 
 from .config import DURATIONS_CACHE, CACHE_DIR
+
+# Network-bound yt-dlp calls; cap to avoid huge process fan-out.
+_DURATION_FETCH_WORKERS = 32
 
 
 def _load_duration_cache() -> dict[str, float]:
@@ -21,11 +25,8 @@ def _save_duration_cache(cache: dict[str, float]) -> None:
     DURATIONS_CACHE.write_text(json.dumps(cache, indent=2))
 
 
-def get_video_duration(video_id: str) -> float | None:
-    cache = _load_duration_cache()
-    if video_id in cache:
-        return cache[video_id]
-
+def _fetch_duration_yt_dlp(video_id: str) -> float | None:
+    """Query duration via yt-dlp; no cache I/O."""
     url = f"https://www.youtube.com/watch?v={video_id}"
     try:
         result = subprocess.run(
@@ -41,18 +42,43 @@ def get_video_duration(video_id: str) -> float | None:
         return None
 
     info = json.loads(result.stdout)
-    duration = float(info["duration"])
+    return float(info["duration"])
+
+
+def get_video_duration(video_id: str) -> float | None:
+    cache = _load_duration_cache()
+    if video_id in cache:
+        return cache[video_id]
+
+    duration = _fetch_duration_yt_dlp(video_id)
+    if duration is None:
+        return None
     cache[video_id] = duration
     _save_duration_cache(cache)
     return duration
 
 
 def get_durations_for_videos(video_ids: list[str]) -> dict[str, float]:
-    durations = {}
+    cache = _load_duration_cache()
+    durations: dict[str, float] = {}
+    to_fetch: list[str] = []
+
     for vid in video_ids:
-        d = get_video_duration(vid)
-        if d is not None:
-            durations[vid] = d
+        if vid in cache:
+            durations[vid] = cache[vid]
         else:
-            print(f"  Skipping {vid} (unavailable)")
+            to_fetch.append(vid)
+
+    if to_fetch:
+        workers = min(_DURATION_FETCH_WORKERS, len(to_fetch))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            fetched = list(ex.map(_fetch_duration_yt_dlp, to_fetch))
+        for vid, d in zip(to_fetch, fetched):
+            if d is not None:
+                durations[vid] = d
+                cache[vid] = d
+            else:
+                print(f"  Skipping {vid} (unavailable)")
+        _save_duration_cache(cache)
+
     return durations

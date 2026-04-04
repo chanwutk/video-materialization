@@ -24,7 +24,7 @@ GEMINI_GENERATE_CONTENT_CONFIG = types.GenerateContentConfig(
     seed=GEMINI_SAMPLING_SEED,
     thinking_config=types.ThinkingConfig(
         # thinking_budget=-1,
-        thinking_level=types.ThinkingLevel.HIGH,
+        thinking_level=types.ThinkingLevel.LOW,
         include_thoughts=True,
     ),
     tool_config=types.ToolConfig(

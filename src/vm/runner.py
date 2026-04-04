@@ -8,6 +8,18 @@ from google.genai import types
 
 from .cache import answer_cache_key, load_answer_cache, save_answer_cache
 from .config import LOW_FPS_RATE, LOW_RES_MEDIA_RESOLUTION, MODEL_NAME
+
+
+def _effective_low_fps(span_s: float) -> float:
+    """
+    Gemini rejects low-fps clips when the window is too short for the requested
+    fps (e.g. 0.2 fps needs ~5s for one frame). Bump fps so span * fps >= 1.
+    """
+    if span_s <= 0:
+        return 1.0
+    if span_s * LOW_FPS_RATE >= 1.0:
+        return LOW_FPS_RATE
+    return max(LOW_FPS_RATE, 1.0 / span_s)
 from .genai_config import GEMINI_QA_GENERATE_CONTENT_CONFIG
 from .genai_response import split_main_and_thought_texts
 from .policies import Policy, SegmentMaterial
@@ -99,10 +111,11 @@ def _build_mixed_parts(
             if mat.material_type == "low-res":
                 part_kwargs["media_resolution"] = types.PartMediaResolution(level=LOW_RES_MEDIA_RESOLUTION)
             elif mat.material_type == "low-fps":
+                span = float(seg.end_s - seg.start_s)
                 part_kwargs["video_metadata"] = types.VideoMetadata(
                     start_offset=f"{seg.start_s}s",
                     end_offset=f"{seg.end_s}s",
-                    fps=LOW_FPS_RATE,
+                    fps=_effective_low_fps(span),
                 )
             parts.append(types.Part(**part_kwargs))
         else:
@@ -118,10 +131,13 @@ def _build_video_parts(
     entry: dict,
     fps: float | None = None,
     media_resolution: str | None = None,
+    video_duration_s: float | None = None,
 ) -> list[types.Part]:
     part_kwargs: dict = {"file_data": types.FileData(file_uri=youtube_url)}
     if fps:
-        part_kwargs["video_metadata"] = types.VideoMetadata(fps=fps)
+        span = float(video_duration_s) if video_duration_s is not None else None
+        eff = _effective_low_fps(span) if span is not None else fps
+        part_kwargs["video_metadata"] = types.VideoMetadata(fps=eff)
     if media_resolution:
         part_kwargs["media_resolution"] = types.PartMediaResolution(level=media_resolution)
     return [types.Part(**part_kwargs), types.Part(text=_build_question_text(entry))]
@@ -197,6 +213,7 @@ async def answer_question(
     sem: asyncio.Semaphore,
     model: str = MODEL_NAME,
     pbar: Any = None,
+    video_duration_s: float | None = None,
 ) -> tuple[int | None, str, str, TokenUsage]:
     """
     Answer a single question asynchronously.
@@ -222,7 +239,9 @@ async def answer_question(
         parts = _build_video_parts(youtube_url, entry)
         contents = types.Content(parts=parts)
     elif policy == Policy.LOW_FPS:
-        parts = _build_video_parts(youtube_url, entry, fps=LOW_FPS_RATE)
+        parts = _build_video_parts(
+            youtube_url, entry, fps=LOW_FPS_RATE, video_duration_s=video_duration_s,
+        )
         contents = types.Content(parts=parts)
     elif policy == Policy.LOW_RES:
         parts = _build_video_parts(youtube_url, entry, media_resolution=LOW_RES_MEDIA_RESOLUTION)

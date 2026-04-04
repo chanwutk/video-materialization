@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 from dataclasses import dataclass
+from pathlib import Path
 
 import altair as alt
 import pandas as pd
@@ -33,8 +34,8 @@ from .segmenter import segment_video
 from .tokens import PolicyTokenLog
 
 ALL_POLICIES = "raw,transcript,visual-description,summary,low-fps,mixed"
-DEFAULT_CONCURRENCY = 1024
-MAX_VIDEO_DURATION_S = 600
+DEFAULT_CONCURRENCY = 16
+MAX_VIDEO_DURATION_S = 1200
 
 # Description, bar, completed/total, %, ETA.
 _PROGRESS_COLUMNS = (
@@ -55,6 +56,49 @@ class Pbar:
 
     def update(self, n: int = 1) -> None:
         self.progress.update(self.task_id, advance=n)
+
+
+def save_tokens_vs_accuracy_chart(
+    plot_df: pd.DataFrame,
+    x_field: str,
+    x_title: str,
+    out_path: Path,
+    chart_title: str,
+) -> None:
+    """Scatter of token cost vs accuracy; writes PNG via Altair/Vega."""
+    points = (
+        alt.Chart(plot_df)
+        .mark_circle(size=120, opacity=0.95)
+        .encode(
+            x=alt.X(f"{x_field}:Q", title=x_title),
+            y=alt.Y("accuracy_pct:Q", title="Accuracy (%)"),
+            tooltip=[
+                alt.Tooltip("policy:N", title="Policy"),
+                alt.Tooltip(f"{x_field}:Q", format=",", title=x_title),
+                alt.Tooltip("accuracy_pct:Q", format=".2f", title="Accuracy (%)"),
+            ],
+        )
+    )
+    labels = (
+        alt.Chart(plot_df)
+        .mark_text(dx=10, dy=5, fontSize=11, align="left", baseline="middle")
+        .encode(
+            x=f"{x_field}:Q",
+            y="accuracy_pct:Q",
+            text="policy:N",
+        )
+    )
+    chart = (
+        (points + labels)
+        .properties(
+            title=chart_title,
+            width=520,
+            height=400,
+        )
+        .configure_axis(grid=True, gridOpacity=0.3)
+        .configure_view(strokeWidth=0)
+    )
+    chart.save(str(out_path), scale_factor=2)
 
 
 def parse_args():
@@ -215,6 +259,7 @@ async def run_experiment_async(args):
                     task = answer_question(
                         client, policy, youtube_url, vid, segs, materialized,
                         entry, sem, model=model, pbar=pbar,
+                        video_duration_s=durations[vid],
                     )
                     query_tasks.append(task)
                     task_meta.append((vid, entry, token_log))
@@ -299,41 +344,29 @@ async def run_experiment_async(args):
 
     # Plot tokens vs accuracy (pandas + Altair; no Python loops on rows)
     plot_df = df.assign(accuracy_pct=df["accuracy"].mul(100))
-    points = (
-        alt.Chart(plot_df)
-        .mark_circle(size=120, opacity=0.95)
-        .encode(
-            x=alt.X("total_tokens:Q", title="Total Tokens (build + query)"),
-            y=alt.Y("accuracy_pct:Q", title="Accuracy (%)"),
-            tooltip=[
-                alt.Tooltip("policy:N", title="Policy"),
-                alt.Tooltip("total_tokens:Q", format=",", title="Total tokens"),
-                alt.Tooltip("accuracy_pct:Q", format=".2f", title="Accuracy (%)"),
-            ],
-        )
-    )
-    labels = (
-        alt.Chart(plot_df)
-        .mark_text(dx=10, dy=5, fontSize=11, align="left", baseline="middle")
-        .encode(
-            x="total_tokens:Q",
-            y="accuracy_pct:Q",
-            text="policy:N",
-        )
-    )
-    chart = (
-        (points + labels)
-        .properties(
-            title="Token Cost vs Accuracy by Policy",
-            width=520,
-            height=400,
-        )
-        .configure_axis(grid=True, gridOpacity=0.3)
-        .configure_view(strokeWidth=0)
-    )
-    png_path = RESULTS_DIR / "tokens_vs_accuracy.png"
-    chart.save(str(png_path), scale_factor=2)
-    print("Saved tokens_vs_accuracy.png")
+    chart_specs = [
+        (
+            "total_tokens",
+            "Total Tokens (build + query)",
+            RESULTS_DIR / "tokens_vs_accuracy.png",
+            "Token Cost vs Accuracy by Policy",
+        ),
+        (
+            "build_total_tokens",
+            "Build Tokens",
+            RESULTS_DIR / "tokens_vs_accuracy_build.png",
+            "Token Cost vs Accuracy by Policy (build only)",
+        ),
+        (
+            "query_total_tokens",
+            "Query Tokens",
+            RESULTS_DIR / "tokens_vs_accuracy_query.png",
+            "Token Cost vs Accuracy by Policy (query only)",
+        ),
+    ]
+    for x_field, x_title, png_path, chart_title in chart_specs:
+        save_tokens_vs_accuracy_chart(plot_df, x_field, x_title, png_path, chart_title)
+        print(f"Saved {png_path.name}")
 
 
 def main():
