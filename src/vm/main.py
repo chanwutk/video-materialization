@@ -35,7 +35,7 @@ from .tokens import PolicyTokenLog, TokenUsage
 
 ALL_POLICIES = "raw,transcript,visual-description,summary,low-fps,mixed"
 DEFAULT_CONCURRENCY = 16
-MAX_VIDEO_DURATION_S = 1200
+MAX_VIDEO_DURATION_S = 1500
 
 # Description, bar, completed/total, %, ETA.
 _PROGRESS_COLUMNS = (
@@ -56,6 +56,17 @@ class Pbar:
 
     def update(self, n: int = 1) -> None:
         self.progress.update(self.task_id, advance=n)
+
+
+def _latency_stats(usages: list[TokenUsage]) -> tuple[float, int, float]:
+    """Return summed latency, live-call count, and mean latency over live calls."""
+    live_latencies = [u.latency_s for u in usages if u.latency_s > 0]
+    if not live_latencies:
+        return 0.0, 0, 0.0
+
+    total_s = float(sum(live_latencies))
+    n_live = len(live_latencies)
+    return total_s, n_live, total_s / n_live
 
 
 def save_tokens_vs_accuracy_chart(
@@ -219,66 +230,81 @@ async def run_experiment_async(args):
         await asyncio.gather(*build_tasks)
     print("  Build phase complete.")
 
-    # Phase 2: Run queries for each policy concurrently
+    # Phase 2: Load materializations and run all policy×question queries in parallel
+    # (ordering is still bounded by --concurrency via the shared semaphore).
     print("\n=== Phase 2: Running queries ===")
     all_results: dict[str, list[dict]] = {p.value: [] for p in policies}
     all_token_logs: dict[str, list[PolicyTokenLog]] = {p.value: [] for p in policies}
 
     total_questions = sum(len(qs) for qs in selected.values())
+    total_query_tasks = total_questions * len(policies)
 
+    mat_keys = [(p, vid) for p in policies for vid in ordered_vids]
+    materialize_tasks = [
+        materialize_video(
+            client,
+            p,
+            vid,
+            f"https://www.youtube.com/watch?v={vid}",
+            video_segments[vid],
+            sem,
+            model=model,
+        )
+        for p, vid in mat_keys
+    ]
+    materialize_results = await asyncio.gather(*materialize_tasks)
+    video_materials = {
+        (p.value, vid): res for (p, vid), res in zip(mat_keys, materialize_results)
+    }
+
+    token_log_by_pv: dict[tuple[str, str], PolicyTokenLog] = {}
     for policy in policies:
-        # Pre-compute materialized data for all videos (all cached from Phase 1)
-        video_materials: dict[str, tuple] = {}  # vid -> (materialized, build_usages)
         for vid in ordered_vids:
-            youtube_url = f"https://www.youtube.com/watch?v={vid}"
-            segs = video_segments[vid]
-            materialized, build_usages = await materialize_video(
-                client, policy, vid, youtube_url, segs, sem, model=model,
+            materialized, build_usages = video_materials[(policy.value, vid)]
+            token_log = PolicyTokenLog(
+                policy=policy.value,
+                video_id=vid,
+                build_usage=build_usages,
             )
-            video_materials[vid] = (materialized, build_usages)
+            all_token_logs[policy.value].append(token_log)
+            token_log_by_pv[(policy.value, vid)] = token_log
 
-        # Build all query tasks
-        query_tasks = []
-        task_meta = []
-        with Progress(*_PROGRESS_COLUMNS) as progress:
-            task_id = progress.add_task(f"  {policy.value}", total=total_questions)
-            pbar = Pbar(progress, task_id)
+    query_tasks: list = []
+    task_meta: list = []
+    with Progress(*_PROGRESS_COLUMNS) as progress:
+        task_id = progress.add_task("  Queries", total=total_query_tasks)
+        pbar = Pbar(progress, task_id)
+        for policy in policies:
             for vid in ordered_vids:
                 youtube_url = f"https://www.youtube.com/watch?v={vid}"
                 segs = video_segments[vid]
-                materialized, build_usages = video_materials[vid]
-
-                token_log = PolicyTokenLog(
-                    policy=policy.value,
-                    video_id=vid,
-                    build_usage=build_usages,
-                )
-                all_token_logs[policy.value].append(token_log)
-
+                materialized, _ = video_materials[(policy.value, vid)]
+                token_log = token_log_by_pv[(policy.value, vid)]
                 for entry in selected[vid]:
-                    task = answer_question(
-                        client, policy, youtube_url, vid, segs, materialized,
-                        entry, sem, model=model, pbar=pbar,
-                        video_duration_s=durations[vid],
+                    query_tasks.append(
+                        answer_question(
+                            client, policy, youtube_url, vid, segs, materialized,
+                            entry, sem, model=model, pbar=pbar,
+                            video_duration_s=durations[vid],
+                        ),
                     )
-                    query_tasks.append(task)
-                    task_meta.append((vid, entry, token_log))
+                    task_meta.append((policy, vid, entry, token_log))
 
-            query_results = await asyncio.gather(*query_tasks)
+        query_results = await asyncio.gather(*query_tasks)
 
-        for (vid, entry, token_log), (predicted_id, raw_response, raw_thoughts, usage) in zip(
-            task_meta, query_results,
-        ):
-            token_log.query_usage.append(usage)
-            all_results[policy.value].append({
-                "video_id": vid,
-                "question_key": entry["key"],
-                "predicted_id": predicted_id,
-                "answer_id": entry["answer_id"],
-                "policy": policy.value,
-                "raw_response": raw_response,
-                "raw_thoughts": raw_thoughts,
-            })
+    for (policy, vid, entry, token_log), (
+        predicted_id, raw_response, raw_thoughts, usage,
+    ) in zip(task_meta, query_results):
+        token_log.query_usage.append(usage)
+        all_results[policy.value].append({
+            "video_id": vid,
+            "question_key": entry["key"],
+            "predicted_id": predicted_id,
+            "answer_id": entry["answer_id"],
+            "policy": policy.value,
+            "raw_response": raw_response,
+            "raw_thoughts": raw_thoughts,
+        })
 
     # Phase 3: Evaluate and output
     print("\n=== Phase 3: Evaluation ===")

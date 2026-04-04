@@ -16,6 +16,12 @@ from .segmenter import Segment
 from .tokens import TokenUsage
 
 
+def _usage_from_cache(cached: dict) -> TokenUsage:
+    usage = TokenUsage.from_dict(cached["usage"])
+    usage.latency_s = 0.0
+    return usage
+
+
 def _make_segment_video_part(youtube_url: str, segment: Segment) -> types.Part:
     return types.Part(
         file_data=types.FileData(file_uri=youtube_url),
@@ -62,7 +68,7 @@ async def build_transcript(
     cached = load_builder_cache(key)
     if cached:
         if pbar: pbar.update(1)
-        return cached["text"], TokenUsage.from_dict(cached["usage"])
+        return cached["text"], _usage_from_cache(cached)
 
     video_part = _make_segment_video_part(youtube_url, segment)
     text, usage, thoughts = await _call_gemini(
@@ -84,7 +90,7 @@ async def build_segment_summary(
     cached = load_builder_cache(key)
     if cached:
         if pbar: pbar.update(1)
-        return cached["text"], TokenUsage.from_dict(cached["usage"])
+        return cached["text"], _usage_from_cache(cached)
 
     video_part = _make_segment_video_part(youtube_url, segment)
     text, usage, thoughts = await _call_gemini(
@@ -107,7 +113,7 @@ async def build_visual_description(
     cached = load_builder_cache(key)
     if cached:
         if pbar: pbar.update(1)
-        return cached["text"], TokenUsage.from_dict(cached["usage"])
+        return cached["text"], _usage_from_cache(cached)
 
     video_part = _make_whole_video_part(youtube_url)
     text, usage, thoughts = await _call_gemini(
@@ -128,7 +134,7 @@ async def build_whole_summary(
     cached = load_builder_cache(key)
     if cached:
         if pbar: pbar.update(1)
-        return cached["text"], TokenUsage.from_dict(cached["usage"])
+        return cached["text"], _usage_from_cache(cached)
 
     video_part = _make_whole_video_part(youtube_url)
     text, usage, thoughts = await _call_gemini(

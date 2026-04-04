@@ -7,8 +7,19 @@ from typing import Any
 from google import genai
 from google.genai import types
 
-from .cache import answer_cache_key, load_answer_cache, save_answer_cache
-from .config import LOW_FPS_RATE, LOW_RES_MEDIA_RESOLUTION, MODEL_NAME
+from .cache import (
+    answer_cache_key,
+    cache_key,
+    load_answer_cache,
+    load_builder_cache,
+    save_answer_cache,
+)
+from .config import (
+    LOW_FPS_RATE,
+    LOW_RES_MEDIA_RESOLUTION,
+    MODEL_NAME,
+    VIDEO_DURATION_CLIP_SLACK_S,
+)
 
 
 def _effective_low_fps(span_s: float) -> float:
@@ -111,13 +122,6 @@ def _mixed_clip_bounds(
     return start, clip_end
 
 
-def _effective_low_fps_for_duration(duration_s: float) -> float:
-    """Stay within (0, 24] fps; target enough samples for short clips."""
-    d = max(float(duration_s), 1e-6)
-    need = max(LOW_FPS_RATE, 2.0 / d)
-    return min(24.0, need)
-
-
 def _mixed_segment_fallback_text(video_id: str, segment_index: int) -> str:
     for kind in ("summary", "transcript"):
         cached = load_builder_cache(cache_key(video_id, segment_index, kind))
@@ -138,35 +142,7 @@ def _build_mixed_parts(
     for seg in segments:
         mat = materialized[seg.index]
         if mat.is_video:
-            parts.append(types.Part(text=f"Segment {seg.index} ({seg.start_s}s-{seg.end_s}s) [{mat.material_type}]:"))
-            part_kwargs: dict = {
-                "file_data": types.FileData(file_uri=youtube_url),
-                "video_metadata": types.VideoMetadata(
-                    start_offset=f"{seg.start_s}s",
-                    end_offset=f"{seg.end_s}s",
-                ),
-            }
             if mat.material_type == "low-res":
-                part_kwargs["media_resolution"] = types.PartMediaResolution(level=LOW_RES_MEDIA_RESOLUTION)
-            elif mat.material_type == "low-fps":
-                span = float(seg.end_s - seg.start_s)
-                part_kwargs["video_metadata"] = types.VideoMetadata(
-                    start_offset=f"{seg.start_s}s",
-                    end_offset=f"{seg.end_s}s",
-                    fps=_effective_low_fps(span),
-                )
-                if (c_start, c_end) != (seg.start_s, seg.end_s):
-                    label += f" (clipped from {seg.start_s}s-{seg.end_s}s)"
-                parts.append(types.Part(text=f"{label}:"))
-                parts.append(types.Part(
-                    file_data=types.FileData(file_uri=youtube_url),
-                    video_metadata=types.VideoMetadata(
-                        start_offset=f"{c_start}s",
-                        end_offset=f"{c_end}s",
-                        fps=_effective_low_fps_for_duration(dur),
-                    ),
-                ))
-            elif mat.material_type == "low-res":
                 parts.append(types.Part(
                     text=f"Segment {seg.index} ({seg.start_s}s-{seg.end_s}s) [{mat.material_type}]:",
                 ))
@@ -178,6 +154,31 @@ def _build_mixed_parts(
                     ),
                     media_resolution=types.PartMediaResolution(level=LOW_RES_MEDIA_RESOLUTION),
                 ))
+            elif mat.material_type == "low-fps":
+                bounds = _mixed_clip_bounds(seg, video_duration_s)
+                if bounds is None:
+                    fb = _mixed_segment_fallback_text(video_id, seg.index)
+                    parts.append(types.Part(
+                        text=f"Segment {seg.index} ({seg.start_s}s-{seg.end_s}s) "
+                        f"[{mat.material_type}]: {fb}"
+                    ))
+                else:
+                    c_start, c_end = bounds
+                    dur = float(c_end - c_start)
+                    label = (
+                        f"Segment {seg.index} ({c_start}s-{c_end}s) [{mat.material_type}]"
+                    )
+                    if (c_start, c_end) != (seg.start_s, seg.end_s):
+                        label += f" (clipped from {seg.start_s}s-{seg.end_s}s)"
+                    parts.append(types.Part(text=f"{label}:"))
+                    parts.append(types.Part(
+                        file_data=types.FileData(file_uri=youtube_url),
+                        video_metadata=types.VideoMetadata(
+                            start_offset=f"{c_start}s",
+                            end_offset=f"{c_end}s",
+                            fps=_effective_low_fps(dur),
+                        ),
+                    ))
             else:
                 raise ValueError(f"Unknown mixed video material_type: {mat.material_type}")
         else:
@@ -289,12 +290,14 @@ async def answer_question(
     )
     cached = load_answer_cache(ck)
     if cached:
+        usage = TokenUsage.from_dict(cached["usage"])
+        usage.latency_s = 0.0
         if pbar: pbar.update(1)
         return (
             cached["predicted_id"],
             cached["raw_response"],
             cached.get("raw_thoughts", ""),
-            TokenUsage.from_dict(cached["usage"]),
+            usage,
         )
 
     if policy == Policy.RAW:
