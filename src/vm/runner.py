@@ -277,15 +277,20 @@ async def answer_question(
     model: str = MODEL_NAME,
     pbar: Any = None,
     video_duration_s: float | None = None,
+    routing_hash: str | None = None,
 ) -> tuple[int | None, str, str, TokenUsage]:
     """
     Answer a single question asynchronously.
     Returns (predicted_id, raw_response, raw_thoughts, usage).
     """
     # Keep prompt changes from silently reusing cached answers from older formats.
+    # For LLM_ROUTED, include routing_hash so different directives don't share cache.
+    policy_tag = f"{policy.value}_{ANSWER_PROMPT_CACHE_VERSION}"
+    if routing_hash:
+        policy_tag = f"{policy_tag}_{routing_hash}"
     ck = answer_cache_key(
         video_id,
-        f"{policy.value}_{ANSWER_PROMPT_CACHE_VERSION}",
+        policy_tag,
         entry["key"],
     )
     cached = load_answer_cache(ck)
@@ -317,7 +322,7 @@ async def answer_question(
     elif policy == Policy.TRANSCRIPT:
         prompt = _build_segmented_text_prompt(materialized, segments, entry)
         contents = prompt
-    elif policy == Policy.MIXED:
+    elif policy in (Policy.MIXED, Policy.LLM_ROUTED):
         parts = _build_mixed_parts(
             materialized, segments, youtube_url, entry, video_id, video_duration_s,
         )

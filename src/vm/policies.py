@@ -27,6 +27,7 @@ class Policy(Enum):
     LOW_FPS = "low-fps"
     LOW_RES = "low-res"
     MIXED = "mixed"
+    LLM_ROUTED = "llm-routed"
 
 
 # Phase 1 pre-build in main: one `materialize_video(..., policy)` per (video, policy) here.
@@ -37,13 +38,15 @@ PHASE1_PREBUILD_POLICIES: tuple[Policy, ...] = (
     Policy.SUMMARY,
 )
 
+# LLM_ROUTED reuses MIXED's pre-built transcripts and summaries; no extra prebuild needed.
+
 
 def prebuild_gemini_call_count(policy: Policy, n_segments: int) -> int:
     """
     Count of Gemini builder invocations (each triggers one progress tick, including cache hits).
     Must match `materialize_video` for the same policy and segment count.
     """
-    if policy in (Policy.RAW, Policy.LOW_FPS, Policy.LOW_RES):
+    if policy in (Policy.RAW, Policy.LOW_FPS, Policy.LOW_RES, Policy.LLM_ROUTED):
         return 0
     if policy in (Policy.VISUAL_DESCRIPTION, Policy.SUMMARY):
         return 1
@@ -159,4 +162,63 @@ async def materialize_video(
             materialized[seg.index] = _pick_mixed_material(t_text, s_text, seg)
         return materialized, build_usages
 
+    if policy == Policy.LLM_ROUTED:
+        raise ValueError(
+            "LLM_ROUTED policy requires routing_decisions; "
+            "use materialize_from_routing() instead."
+        )
+
     raise ValueError(f"Unknown policy: {policy}")
+
+
+def materialize_from_routing(
+    video_id: str,
+    segments: list[Segment],
+    routing_decisions: list[str],
+) -> dict[int, SegmentMaterial]:
+    """
+    Build SegmentMaterial dict from pre-computed routing decisions.
+    Reads transcripts/summaries from the builder cache (must be pre-built).
+    No API calls needed.
+    """
+    from .cache import load_builder_cache, cache_key
+
+    materialized: dict[int, SegmentMaterial] = {}
+    for seg, decision in zip(segments, routing_decisions):
+        if decision == "TRANSCRIPT":
+            cached = load_builder_cache(cache_key(video_id, seg.index, "transcript"))
+            text = cached["text"] if cached else "[NO TRANSCRIPT]"
+            materialized[seg.index] = SegmentMaterial(text=text, material_type="transcript")
+        elif decision == "SUMMARY":
+            cached = load_builder_cache(cache_key(video_id, seg.index, "summary"))
+            text = cached["text"] if cached else "[NO SUMMARY]"
+            materialized[seg.index] = SegmentMaterial(text=text, material_type="summary")
+        elif decision == "LOW_FPS":
+            duration = seg.end_s - seg.start_s
+            if duration < MIN_SEGMENT_S_FOR_MIXED_LOW_FPS:
+                # Too short for video; fall back to transcript or summary
+                cached = load_builder_cache(cache_key(video_id, seg.index, "transcript"))
+                if cached and cached.get("text") and _word_count(cached["text"]) > 0:
+                    materialized[seg.index] = SegmentMaterial(
+                        text=cached["text"], material_type="transcript",
+                    )
+                else:
+                    cached_s = load_builder_cache(cache_key(video_id, seg.index, "summary"))
+                    text = cached_s["text"] if cached_s else "[NO CONTEXT]"
+                    materialized[seg.index] = SegmentMaterial(
+                        text=text, material_type="summary",
+                    )
+            else:
+                materialized[seg.index] = SegmentMaterial(
+                    text=None, material_type="low-fps", is_video=True,
+                )
+        elif decision == "SKIP":
+            materialized[seg.index] = SegmentMaterial(
+                text="[SEGMENT SKIPPED]", material_type="summary",
+            )
+        else:
+            # Fallback
+            cached = load_builder_cache(cache_key(video_id, seg.index, "summary"))
+            text = cached["text"] if cached else "[NO CONTEXT]"
+            materialized[seg.index] = SegmentMaterial(text=text, material_type="summary")
+    return materialized

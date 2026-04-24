@@ -16,19 +16,22 @@ from rich.progress import (
 )
 
 from .config import (
-    MODEL_NAME, SEGMENT_LENGTH_S, TOP_K_VIDEOS,
+    GEPA_DIR,
+    MODEL_NAME, ROUTER_MODEL_NAME, SEGMENT_LENGTH_S, TOP_K_VIDEOS,
     RESULTS_DIR, DATA_DIR,
 )
-from .dataset import download_minerva, group_by_video, select_top_k
+from .dataset import download_minerva, group_by_video, select_top_k, train_test_split
 from .duration import get_durations_for_videos
 from .evaluator import evaluate
 from .policies import (
     PHASE1_PREBUILD_POLICIES,
     Policy,
+    materialize_from_routing,
     materialize_video,
     phase1_prebuild_total_calls,
     prebuild_gemini_call_count,
 )
+from .router import route_video_segments
 from .runner import answer_question
 from .segmenter import segment_video
 from .tokens import PolicyTokenLog, TokenUsage
@@ -124,6 +127,11 @@ def parse_args():
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
                         help="Max concurrent Gemini API calls")
     parser.add_argument("--dry-run", action="store_true", help="Load data and print plan without API calls")
+    parser.add_argument("--gepa", action="store_true", help="Run GEPA optimization on train split")
+    parser.add_argument("--gepa-eval", type=str, default=None,
+                        help="Path to GEPA optimization_result.json; evaluates the learned directive on test split")
+    parser.add_argument("--gepa-max-calls", type=int, default=None,
+                        help="Override GEPA max_metric_calls")
     return parser.parse_args()
 
 
@@ -417,9 +425,313 @@ async def run_experiment_async(args):
         print(f"Saved {png_path.name}")
 
 
+async def run_gepa_prebuild(args, selected, durations):
+    """Pre-build materializations for GEPA (transcripts + summaries for all segments)."""
+    from google import genai as genai_mod
+    client = genai_mod.Client()
+    sem = asyncio.Semaphore(args.concurrency)
+    model = args.model
+
+    ordered_vids = sorted(selected.keys(), key=lambda v: durations[v], reverse=True)
+    video_segments = {}
+    for vid in ordered_vids:
+        segs = segment_video(durations[vid], args.segment_length)
+        video_segments[vid] = segs
+
+    # Only need TRANSCRIPT and MIXED (which builds both transcript + summary per segment)
+    prebuild_policies = (Policy.TRANSCRIPT, Policy.MIXED)
+    n_build_calls = sum(
+        sum(prebuild_gemini_call_count(p, len(segs)) for p in prebuild_policies)
+        for segs in video_segments.values()
+    )
+
+    print("\n=== Pre-building materializations for GEPA ===")
+    build_tasks = []
+    with Progress(*_PROGRESS_COLUMNS) as progress:
+        task_id = progress.add_task("  Building", total=n_build_calls)
+        pbar = Pbar(progress, task_id)
+        for vid in ordered_vids:
+            youtube_url = f"https://www.youtube.com/watch?v={vid}"
+            segs = video_segments[vid]
+            for policy in prebuild_policies:
+                build_tasks.append(
+                    materialize_video(
+                        client, policy, vid, youtube_url, segs, sem, model=model, pbar=pbar,
+                    ),
+                )
+        await asyncio.gather(*build_tasks)
+    print("  Pre-build complete.")
+
+
+async def run_gepa_eval(args, directive: str, test_videos: dict, durations: dict):
+    """Evaluate a GEPA-learned directive on the test set alongside baselines."""
+    from google import genai as genai_mod
+    client = genai_mod.Client()
+    sem = asyncio.Semaphore(args.concurrency)
+    model = args.model
+
+    ordered_vids = sorted(test_videos.keys(), key=lambda v: durations[v], reverse=True)
+    video_segments = {}
+    for vid in ordered_vids:
+        video_segments[vid] = segment_video(durations[vid], args.segment_length)
+
+    # Pre-build materializations for test videos too
+    prebuild_policies = (Policy.TRANSCRIPT, Policy.MIXED, Policy.VISUAL_DESCRIPTION, Policy.SUMMARY)
+    n_build_calls = sum(
+        sum(prebuild_gemini_call_count(p, len(segs)) for p in prebuild_policies)
+        for segs in video_segments.values()
+    )
+    print("\n=== Pre-building materializations for test videos ===")
+    build_tasks = []
+    with Progress(*_PROGRESS_COLUMNS) as progress:
+        task_id = progress.add_task("  Building", total=n_build_calls)
+        pbar = Pbar(progress, task_id)
+        for vid in ordered_vids:
+            youtube_url = f"https://www.youtube.com/watch?v={vid}"
+            segs = video_segments[vid]
+            for policy in prebuild_policies:
+                build_tasks.append(
+                    materialize_video(
+                        client, policy, vid, youtube_url, segs, sem, model=model, pbar=pbar,
+                    ),
+                )
+        await asyncio.gather(*build_tasks)
+    print("  Pre-build complete.")
+
+    # Run LLM router on test videos with the learned directive
+    print("\n=== Routing test videos with learned directive ===")
+    router_client = genai_mod.Client()
+    routing_decisions_by_vid: dict[str, list[str]] = {}
+    for vid in ordered_vids:
+        decisions = route_video_segments(
+            router_client, vid, video_segments[vid], directive,
+            model=ROUTER_MODEL_NAME,
+        )
+        routing_decisions_by_vid[vid] = decisions
+        n_t = decisions.count("TRANSCRIPT")
+        n_s = decisions.count("SUMMARY")
+        n_v = decisions.count("LOW_FPS")
+        n_k = decisions.count("SKIP")
+        print(f"  {vid}: T={n_t} S={n_s} V={n_v} K={n_k}")
+
+    # Evaluate LLM_ROUTED + baselines
+    baseline_policies = [Policy(p.strip()) for p in args.policies.split(",")]
+    all_policies = baseline_policies + [Policy.LLM_ROUTED]
+
+    # Materialize for all policies
+    mat_keys = []
+    materialize_tasks_list = []
+    for p in baseline_policies:
+        for vid in ordered_vids:
+            mat_keys.append((p, vid))
+            materialize_tasks_list.append(
+                materialize_video(
+                    client, p, vid,
+                    f"https://www.youtube.com/watch?v={vid}",
+                    video_segments[vid], sem, model=model,
+                )
+            )
+    materialize_results = await asyncio.gather(*materialize_tasks_list)
+    video_materials = {
+        (p.value, vid): res for (p, vid), res in zip(mat_keys, materialize_results)
+    }
+
+    # Add LLM_ROUTED materializations (from routing decisions, no API calls)
+    for vid in ordered_vids:
+        materialized = materialize_from_routing(
+            vid, video_segments[vid], routing_decisions_by_vid[vid],
+        )
+        video_materials[(Policy.LLM_ROUTED.value, vid)] = (materialized, [])
+
+    # Run queries for all policies
+    total_questions = sum(len(qs) for qs in test_videos.values())
+    all_results: dict[str, list[dict]] = {p.value: [] for p in all_policies}
+    all_token_logs: dict[str, list[PolicyTokenLog]] = {p.value: [] for p in all_policies}
+
+    token_log_by_pv: dict[tuple[str, str], PolicyTokenLog] = {}
+    for policy in all_policies:
+        for vid in ordered_vids:
+            materialized, build_usages = video_materials[(policy.value, vid)]
+            token_log = PolicyTokenLog(
+                policy=policy.value, video_id=vid, build_usage=build_usages,
+            )
+            all_token_logs[policy.value].append(token_log)
+            token_log_by_pv[(policy.value, vid)] = token_log
+
+    import hashlib
+    directive_hash = hashlib.sha256(directive.encode()).hexdigest()[:16]
+
+    query_tasks = []
+    task_meta = []
+    total_query_tasks = total_questions * len(all_policies)
+    with Progress(*_PROGRESS_COLUMNS) as progress:
+        task_id = progress.add_task("  Queries", total=total_query_tasks)
+        pbar = Pbar(progress, task_id)
+        for policy in all_policies:
+            r_hash = directive_hash if policy == Policy.LLM_ROUTED else None
+            for vid in ordered_vids:
+                youtube_url = f"https://www.youtube.com/watch?v={vid}"
+                segs = video_segments[vid]
+                materialized, _ = video_materials[(policy.value, vid)]
+                token_log = token_log_by_pv[(policy.value, vid)]
+                for entry in test_videos[vid]:
+                    query_tasks.append(
+                        answer_question(
+                            client, policy, youtube_url, vid, segs, materialized,
+                            entry, sem, model=model, pbar=pbar,
+                            video_duration_s=durations[vid],
+                            routing_hash=r_hash,
+                        ),
+                    )
+                    task_meta.append((policy, vid, entry, token_log))
+        query_results = await asyncio.gather(*query_tasks)
+
+    for (policy, vid, entry, token_log), (
+        predicted_id, raw_response, raw_thoughts, usage,
+    ) in zip(task_meta, query_results):
+        token_log.query_usage.append(usage)
+        all_results[policy.value].append({
+            "video_id": vid,
+            "question_key": entry["key"],
+            "predicted_id": predicted_id,
+            "answer_id": entry["answer_id"],
+            "policy": policy.value,
+            "raw_response": raw_response,
+            "raw_thoughts": raw_thoughts,
+        })
+
+    # Evaluation and output
+    print("\n=== Test Set Evaluation ===")
+    gepa_results_dir = RESULTS_DIR / "gepa_eval"
+    gepa_results_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_rows = []
+    for policy in all_policies:
+        preds = all_results[policy.value]
+        eval_result = evaluate(preds)
+        logs = all_token_logs[policy.value]
+
+        total_build = sum(log.total_build_tokens for log in logs)
+        total_query = sum(log.total_query_tokens for log in logs)
+        total = total_build + total_query
+
+        build_prompt = sum(sum(u.prompt_tokens for u in log.build_usage) for log in logs)
+        build_output = sum(sum(u.candidates_tokens for u in log.build_usage) for log in logs)
+        build_thoughts = sum(sum(u.thoughts_tokens for u in log.build_usage) for log in logs)
+        query_prompt = sum(sum(u.prompt_tokens for u in log.query_usage) for log in logs)
+        query_output = sum(sum(u.candidates_tokens for u in log.query_usage) for log in logs)
+        query_thoughts = sum(sum(u.thoughts_tokens for u in log.query_usage) for log in logs)
+
+        build_usages_flat = [u for log in logs for u in log.build_usage]
+        query_usages_flat = [u for log in logs for u in log.query_usage]
+        build_lat_s, build_n_api, build_mean_s = _latency_stats(build_usages_flat)
+        query_lat_s, query_n_api, query_mean_s = _latency_stats(query_usages_flat)
+
+        row = {
+            "policy": policy.value,
+            "accuracy": eval_result["accuracy"],
+            "correct": eval_result["correct"],
+            "total": eval_result["total"],
+            "unparsed": eval_result["unparsed"],
+            "build_prompt_tokens": build_prompt,
+            "build_output_tokens": build_output,
+            "build_thoughts_tokens": build_thoughts,
+            "build_total_tokens": total_build,
+            "query_prompt_tokens": query_prompt,
+            "query_output_tokens": query_output,
+            "query_thoughts_tokens": query_thoughts,
+            "query_total_tokens": total_query,
+            "total_tokens": total,
+            "build_api_latency_s_sum": build_lat_s,
+            "build_api_calls_live": build_n_api,
+            "build_api_latency_mean_s": build_mean_s,
+            "query_api_latency_s_sum": query_lat_s,
+            "query_api_calls_live": query_n_api,
+            "query_api_latency_mean_s": query_mean_s,
+        }
+        summary_rows.append(row)
+
+        print(f"\n{policy.value}:")
+        print(f"  Accuracy: {eval_result['accuracy']:.1%} ({eval_result['correct']}/{eval_result['total']})")
+        print(f"  Unparsed: {eval_result['unparsed']}")
+        print(f"  Build tokens: {total_build:,}")
+        print(f"  Query tokens: {total_query:,}")
+        print(f"  Total tokens: {total:,}")
+
+    df = pd.DataFrame(summary_rows)
+    df.to_csv(gepa_results_dir / "token_breakdown.csv", index=False)
+    print(f"\nSaved token_breakdown.csv")
+
+    # Save raw results
+    raw_output = {
+        "directive": directive,
+        "results": {p: all_results[p] for p in all_results},
+        "token_logs": {
+            p: [log.to_dict() for log in all_token_logs[p]]
+            for p in all_token_logs
+        },
+    }
+    (gepa_results_dir / "raw_results.json").write_text(json.dumps(raw_output, indent=2))
+    print("Saved raw_results.json")
+
+    # Plot
+    plot_df = df.assign(accuracy_pct=df["accuracy"].mul(100))
+    chart_specs = [
+        (
+            "total_tokens",
+            "Total Tokens (build + query)",
+            gepa_results_dir / "tokens_vs_accuracy.png",
+            "Token Cost vs Accuracy (test set, with GEPA-learned policy)",
+        ),
+        (
+            "query_total_tokens",
+            "Query Tokens",
+            gepa_results_dir / "tokens_vs_accuracy_query.png",
+            "Query Token Cost vs Accuracy (test set, with GEPA-learned policy)",
+        ),
+    ]
+    for x_field, x_title, png_path, chart_title in chart_specs:
+        save_tokens_vs_accuracy_chart(plot_df, x_field, x_title, png_path, chart_title)
+        print(f"Saved {png_path.name}")
+
+
 def main():
     args = parse_args()
-    asyncio.run(run_experiment_async(args))
+
+    if args.gepa:
+        # GEPA optimization mode
+        selected, durations = select_videos(args.top_k)
+        train, test = train_test_split(selected)
+
+        # Pre-build materializations for train videos
+        asyncio.run(run_gepa_prebuild(args, train, durations))
+
+        # Run GEPA optimization
+        from .gepa_optimizer import run_gepa_optimization
+        from .config import GEPA_MAX_METRIC_CALLS
+        max_calls = args.gepa_max_calls or GEPA_MAX_METRIC_CALLS
+        run_gepa_optimization(
+            train_videos=train,
+            durations=durations,
+            segment_length=args.segment_length,
+            query_model=args.model,
+            max_metric_calls=max_calls,
+        )
+
+    elif args.gepa_eval:
+        # Evaluate GEPA-learned directive on test set
+        result_data = json.loads(Path(args.gepa_eval).read_text())
+        directive = result_data["best_candidate"]
+        print(f"Loaded directive from {args.gepa_eval}")
+        print(f"  Score: {result_data['best_score']:.3f}")
+        print(f"  Directive:\n{directive}\n")
+
+        selected, durations = select_videos(args.top_k)
+        train, test = train_test_split(selected)
+        asyncio.run(run_gepa_eval(args, directive, test, durations))
+
+    else:
+        asyncio.run(run_experiment_async(args))
 
 
 if __name__ == "__main__":

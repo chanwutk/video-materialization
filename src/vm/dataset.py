@@ -1,9 +1,10 @@
 import json
+import random
 from collections import Counter
 
 import httpx
 
-from .config import MINERVA_URL, MINERVA_LOCAL, DATA_DIR
+from .config import MINERVA_URL, MINERVA_LOCAL, DATA_DIR, GEPA_TRAIN_TEST_SEED, GEPA_TRAIN_SIZE
 
 
 def download_minerva() -> list[dict]:
@@ -48,3 +49,20 @@ def select_top_k(
     print(f"  Total questions: {total_q}")
 
     return selected
+
+
+def train_test_split(
+    selected: dict[str, list[dict]],
+) -> tuple[dict[str, list[dict]], dict[str, list[dict]]]:
+    """Split selected videos into train and test sets with a fixed seed."""
+    vids = sorted(selected.keys())
+    rng = random.Random(GEPA_TRAIN_TEST_SEED)
+    rng.shuffle(vids)
+    train_vids = vids[:GEPA_TRAIN_SIZE]
+    test_vids = vids[GEPA_TRAIN_SIZE:]
+    train = {v: selected[v] for v in train_vids}
+    test = {v: selected[v] for v in test_vids}
+    print(f"\nTrain/test split: {len(train)} train, {len(test)} test videos")
+    print(f"  Train questions: {sum(len(qs) for qs in train.values())}")
+    print(f"  Test questions: {sum(len(qs) for qs in test.values())}")
+    return train, test
