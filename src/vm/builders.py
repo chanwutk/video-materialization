@@ -10,7 +10,7 @@ from .cache import (
     load_builder_cache, save_builder_cache,
 )
 from .config import MODEL_NAME
-from .genai_config import GEMINI_GENERATE_CONTENT_CONFIG
+from .genai_config import get_builder_config
 from .genai_response import split_main_and_thought_texts
 from .segmenter import Segment
 from .tokens import TokenUsage
@@ -51,7 +51,7 @@ async def _call_gemini(
         response = await client.aio.models.generate_content(
             model=model,
             contents=types.Content(parts=[video_part, text_part]),
-            config=GEMINI_GENERATE_CONTENT_CONFIG,
+            config=get_builder_config(model),
         )
         latency_s = time.monotonic() - t0
     main_text, thoughts_text = split_main_and_thought_texts(response)

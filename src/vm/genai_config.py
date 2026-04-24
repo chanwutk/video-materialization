@@ -16,17 +16,15 @@ _HARM_CATEGORIES = (
     types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY,
 )
 
-GEMINI_GENERATE_CONTENT_CONFIG = types.GenerateContentConfig(
+# Models that support ThinkingConfig with thinking_level.
+_THINKING_SUPPORTED_MODELS = {"gemini-3.1-pro-preview"}
+
+_BASE_CONFIG_KWARGS: dict[str, Any] = dict(
     temperature=0.0,
     top_p=1.0,
     top_k=1,
     candidate_count=1,
     seed=GEMINI_SAMPLING_SEED,
-    thinking_config=types.ThinkingConfig(
-        # thinking_budget=-1,
-        thinking_level=types.ThinkingLevel.LOW,
-        include_thoughts=True,
-    ),
     tool_config=types.ToolConfig(
         function_calling_config=types.FunctionCallingConfig(
             mode=types.FunctionCallingConfigMode.NONE,
@@ -37,6 +35,20 @@ GEMINI_GENERATE_CONTENT_CONFIG = types.GenerateContentConfig(
         types.SafetySetting(category=c, threshold=types.HarmBlockThreshold.OFF)
         for c in _HARM_CATEGORIES
     ],
+)
+
+# Default config with thinking (for gemini-3.1-pro-preview).
+GEMINI_GENERATE_CONTENT_CONFIG = types.GenerateContentConfig(
+    **_BASE_CONFIG_KWARGS,
+    thinking_config=types.ThinkingConfig(
+        thinking_level=types.ThinkingLevel.LOW,
+        include_thoughts=True,
+    ),
+)
+
+# Config without thinking (for models that don't support it).
+GEMINI_GENERATE_CONTENT_CONFIG_NO_THINKING = types.GenerateContentConfig(
+    **_BASE_CONFIG_KWARGS,
 )
 
 # Video QA: JSON object {"choice": 1..5} per Gemini structured output (JSON Schema).
@@ -59,3 +71,24 @@ GEMINI_QA_GENERATE_CONTENT_CONFIG = GEMINI_GENERATE_CONTENT_CONFIG.model_copy(
         "response_json_schema": QA_CHOICE_RESPONSE_JSON_SCHEMA,
     },
 )
+
+GEMINI_QA_GENERATE_CONTENT_CONFIG_NO_THINKING = GEMINI_GENERATE_CONTENT_CONFIG_NO_THINKING.model_copy(
+    update={
+        "response_mime_type": "application/json",
+        "response_json_schema": QA_CHOICE_RESPONSE_JSON_SCHEMA,
+    },
+)
+
+
+def get_qa_config(model: str) -> types.GenerateContentConfig:
+    """Return the appropriate QA config based on model thinking support."""
+    if model in _THINKING_SUPPORTED_MODELS:
+        return GEMINI_QA_GENERATE_CONTENT_CONFIG
+    return GEMINI_QA_GENERATE_CONTENT_CONFIG_NO_THINKING
+
+
+def get_builder_config(model: str) -> types.GenerateContentConfig:
+    """Return the appropriate builder config based on model thinking support."""
+    if model in _THINKING_SUPPORTED_MODELS:
+        return GEMINI_GENERATE_CONTENT_CONFIG
+    return GEMINI_GENERATE_CONTENT_CONFIG_NO_THINKING

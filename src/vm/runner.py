@@ -32,7 +32,7 @@ def _effective_low_fps(span_s: float) -> float:
     if span_s * LOW_FPS_RATE >= 1.0:
         return LOW_FPS_RATE
     return max(LOW_FPS_RATE, 1.0 / span_s)
-from .genai_config import GEMINI_QA_GENERATE_CONTENT_CONFIG
+from .genai_config import get_qa_config
 from .genai_response import split_main_and_thought_texts
 from .policies import Policy, SegmentMaterial
 from .segmenter import Segment
@@ -335,7 +335,7 @@ async def answer_question(
         response = await client.aio.models.generate_content(
             model=model,
             contents=contents,
-            config=GEMINI_QA_GENERATE_CONTENT_CONFIG,
+            config=get_qa_config(model),
         )
         latency_s = time.monotonic() - t0
 

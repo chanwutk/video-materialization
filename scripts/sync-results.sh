@@ -4,7 +4,7 @@
 set -euo pipefail
 
 SERVER="bombe"
-REMOTE_DIR="~/video-materialize"
+REMOTE_DIR="/work/cwkt/projects/materialized-video"
 LOCAL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 echo "=== Syncing results from $SERVER ==="
