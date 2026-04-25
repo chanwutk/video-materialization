@@ -9,6 +9,7 @@ from google.genai import types
 from .cache import load_builder_cache, cache_key
 from .config import ROUTER_MODEL_NAME, ROUTING_CACHE_DIR
 from .genai_config import GEMINI_SAMPLING_SEED, _HARM_CATEGORIES
+from .retry import with_retries
 from .segmenter import Segment
 
 VALID_DECISIONS = {"TRANSCRIPT", "SUMMARY", "LOW_FPS", "SKIP"}
@@ -135,10 +136,12 @@ def route_video_segments(
         segments_info=segments_info,
     )
 
-    response = client.models.generate_content(
+    response = with_retries(
+        client.models.generate_content,
         model=model,
         contents=prompt,
         config=ROUTER_GENERATE_CONFIG,
+        label=f"router({video_id})",
     )
 
     raw = response.text.strip()

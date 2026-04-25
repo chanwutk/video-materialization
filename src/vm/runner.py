@@ -33,6 +33,7 @@ def _effective_low_fps(span_s: float) -> float:
         return LOW_FPS_RATE
     return max(LOW_FPS_RATE, 1.0 / span_s)
 from .genai_config import get_qa_config
+from .retry import with_retries_async
 from .genai_response import split_main_and_thought_texts
 from .policies import Policy, SegmentMaterial
 from .segmenter import Segment
@@ -332,10 +333,12 @@ async def answer_question(
 
     async with sem:
         t0 = time.monotonic()
-        response = await client.aio.models.generate_content(
+        response = await with_retries_async(
+            client.aio.models.generate_content,
             model=model,
             contents=contents,
             config=get_qa_config(model),
+            label=f"qa({video_id},{entry['key']})",
         )
         latency_s = time.monotonic() - t0
 

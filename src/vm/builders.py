@@ -11,6 +11,7 @@ from .cache import (
 )
 from .config import MODEL_NAME
 from .genai_config import get_builder_config
+from .retry import with_retries_async
 from .genai_response import split_main_and_thought_texts
 from .segmenter import Segment
 from .tokens import TokenUsage
@@ -48,10 +49,12 @@ async def _call_gemini(
     text_part = types.Part(text=prompt)
     async with sem:
         t0 = time.monotonic()
-        response = await client.aio.models.generate_content(
+        response = await with_retries_async(
+            client.aio.models.generate_content,
             model=model,
             contents=types.Content(parts=[video_part, text_part]),
             config=get_builder_config(model),
+            label="builder",
         )
         latency_s = time.monotonic() - t0
     main_text, thoughts_text = split_main_and_thought_texts(response)
