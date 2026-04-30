@@ -8,8 +8,12 @@ from google import genai
 from .builders import (
     build_transcript, build_segment_summary,
     build_visual_description, build_whole_summary,
+    build_llovi_stream, llovi_clip_starts,
 )
 from .config import (
+    LLOVI_CAPTIONER_MODEL,
+    LLOVI_DENSE_STRIDE_S,
+    LLOVI_SPARSE_STRIDE_S,
     MIN_SEGMENT_S_FOR_MIXED_LOW_FPS,
     SPEECH_DENSE_WORD_THRESHOLD,
     VISUALLY_ACTIVE_WORD_THRESHOLD,
@@ -28,6 +32,8 @@ class Policy(Enum):
     LOW_RES = "low-res"
     MIXED = "mixed"
     LLM_ROUTED = "llm-routed"
+    LLOVI_DENSE = "llovi-dense"
+    LLOVI_SPARSE = "llovi-sparse"
 
 
 # Phase 1 pre-build in main: one `materialize_video(..., policy)` per (video, policy) here.
@@ -39,13 +45,23 @@ PHASE1_PREBUILD_POLICIES: tuple[Policy, ...] = (
 )
 
 # LLM_ROUTED reuses MIXED's pre-built transcripts and summaries; no extra prebuild needed.
+# LLOVI_DENSE/SPARSE share per-clip caches keyed by (video_id, clip_start_s).
 
 
-def prebuild_gemini_call_count(policy: Policy, n_segments: int) -> int:
+def _llovi_stride_for(policy: Policy) -> int:
+    if policy == Policy.LLOVI_DENSE:
+        return LLOVI_DENSE_STRIDE_S
+    if policy == Policy.LLOVI_SPARSE:
+        return LLOVI_SPARSE_STRIDE_S
+    raise ValueError(f"Not an LLoVi policy: {policy}")
+
+
+def prebuild_gemini_call_count(policy: Policy, segments: list[Segment]) -> int:
     """
     Count of Gemini builder invocations (each triggers one progress tick, including cache hits).
-    Must match `materialize_video` for the same policy and segment count.
+    Must match `materialize_video` for the same policy and segments.
     """
+    n_segments = len(segments)
     if policy in (Policy.RAW, Policy.LOW_FPS, Policy.LOW_RES, Policy.LLM_ROUTED):
         return 0
     if policy in (Policy.VISUAL_DESCRIPTION, Policy.SUMMARY):
@@ -54,13 +70,18 @@ def prebuild_gemini_call_count(policy: Policy, n_segments: int) -> int:
         return n_segments
     if policy == Policy.MIXED:
         return 2 * n_segments
+    if policy in (Policy.LLOVI_DENSE, Policy.LLOVI_SPARSE):
+        if not segments:
+            return 0
+        duration_s = segments[-1].end_s
+        return len(llovi_clip_starts(duration_s, _llovi_stride_for(policy)))
     raise ValueError(f"Unhandled policy for prebuild count: {policy}")
 
 
 def phase1_prebuild_total_calls(video_segments: dict[str, list]) -> int:
     """Total builder calls for Phase 1 over all videos."""
     return sum(
-        sum(prebuild_gemini_call_count(p, len(segs)) for p in PHASE1_PREBUILD_POLICIES)
+        sum(prebuild_gemini_call_count(p, segs) for p in PHASE1_PREBUILD_POLICIES)
         for segs in video_segments.values()
     )
 
@@ -167,6 +188,24 @@ async def materialize_video(
             "LLM_ROUTED policy requires routing_decisions; "
             "use materialize_from_routing() instead."
         )
+
+    if policy in (Policy.LLOVI_DENSE, Policy.LLOVI_SPARSE):
+        if not segments:
+            materialized[0] = SegmentMaterial(
+                text="", material_type=f"{policy.value}-captions",
+            )
+            return materialized, build_usages
+        duration_s = float(segments[-1].end_s)
+        stride = _llovi_stride_for(policy)
+        text, usages = await build_llovi_stream(
+            client, video_id, youtube_url, duration_s, stride, sem,
+            model=LLOVI_CAPTIONER_MODEL, pbar=pbar,
+        )
+        build_usages.extend(usages)
+        materialized[0] = SegmentMaterial(
+            text=text, material_type=f"{policy.value}-captions",
+        )
+        return materialized, build_usages
 
     raise ValueError(f"Unknown policy: {policy}")
 

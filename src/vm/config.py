@@ -41,3 +41,12 @@ LOW_RES_MEDIA_RESOLUTION = "MEDIA_RESOLUTION_LOW"
 GEPA_MAX_METRIC_CALLS = 150
 GEPA_TRAIN_TEST_SEED = 42
 GEPA_TRAIN_SIZE = 10
+
+# LLoVi baseline (Zhang et al., 2023). Per-clip captions concatenated as text context.
+LLOVI_CAPTIONER_MODEL = "gemini-2.5-flash"
+LLOVI_CLIP_LENGTH_S = 1
+LLOVI_CLIP_FPS = 4  # 1s window with multi-frame sampling so motion is captured.
+LLOVI_DENSE_STRIDE_S = 1
+LLOVI_SPARSE_STRIDE_S = 8
+LLOVI_CAPTION_PROMPT = "Describe this video in detail."
+LLOVI_NO_CAPTION_PLACEHOLDER = "[NO CAPTION]"

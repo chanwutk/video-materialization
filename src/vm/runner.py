@@ -1,11 +1,13 @@
 import asyncio
 import json
 import re
+import sys
 import time
 from typing import Any
 
 from google import genai
 from google.genai import types
+from google.genai import errors as genai_errors
 
 from .cache import (
     answer_cache_key,
@@ -52,6 +54,10 @@ Each piece of context is labeled with its materialization type:
 - [summary]: A brief combined overview of both visual and audio content.
 - [low-fps]: A low-frame-rate video clip of the segment (visual only).
 - [low-res]: A low-resolution video clip of the segment.
+- [llovi-dense-captions] / [llovi-sparse-captions]: A stream of short
+  per-clip captions, each prefixed with its time range [Xs-Ys]. Captions
+  are independent and may be repetitive; use the time ranges to follow
+  temporal order.
 
 Use the type labels to interpret each piece of context appropriately.
 """
@@ -317,7 +323,10 @@ async def answer_question(
     elif policy == Policy.LOW_RES:
         parts = _build_video_parts(youtube_url, entry, media_resolution=LOW_RES_MEDIA_RESOLUTION)
         contents = types.Content(parts=parts)
-    elif policy in (Policy.VISUAL_DESCRIPTION, Policy.SUMMARY):
+    elif policy in (
+        Policy.VISUAL_DESCRIPTION, Policy.SUMMARY,
+        Policy.LLOVI_DENSE, Policy.LLOVI_SPARSE,
+    ):
         prompt = _build_nonsegmented_text_prompt(materialized[0], entry)
         contents = prompt
     elif policy == Policy.TRANSCRIPT:
@@ -333,13 +342,37 @@ async def answer_question(
 
     async with sem:
         t0 = time.monotonic()
-        response = await with_retries_async(
-            client.aio.models.generate_content,
-            model=model,
-            contents=contents,
-            config=get_qa_config(model),
-            label=f"qa({video_id},{entry['key']})",
-        )
+        try:
+            response = await with_retries_async(
+                client.aio.models.generate_content,
+                model=model,
+                contents=contents,
+                config=get_qa_config(model),
+                label=f"qa({video_id},{entry['key']})",
+            )
+        except genai_errors.ClientError as exc:
+            # Per-question over-context error: record as unparsed and continue,
+            # so one bad question doesn't kill the whole asyncio.gather.
+            msg = str(exc)
+            is_too_large = exc.code == 400 and "token count exceeds" in msg.lower()
+            if not is_too_large:
+                raise
+            latency_s = time.monotonic() - t0
+            print(
+                f"[qa] context-too-large for {policy.value} {video_id} {entry['key']}: {msg[:200]}",
+                file=sys.stderr,
+            )
+            usage = TokenUsage(latency_s=latency_s)
+            placeholder = "[ERROR: input context exceeds Gemini limit]"
+            save_answer_cache(ck, {
+                "predicted_id": None,
+                "raw_response": placeholder,
+                "raw_thoughts": "",
+                "usage": usage.to_dict(),
+                "error": "input_context_too_large",
+            })
+            if pbar: pbar.update(1)
+            return None, placeholder, "", usage
         latency_s = time.monotonic() - t0
 
     raw_text, raw_thoughts = split_main_and_thought_texts(response)

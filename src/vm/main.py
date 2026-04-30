@@ -202,7 +202,7 @@ async def run_experiment_async(args):
         print(f"\nEstimated API calls:")
         print(f"  Builder calls: {n_builder_calls}")
         for p in PHASE1_PREBUILD_POLICIES:
-            per_run = sum(prebuild_gemini_call_count(p, len(segs)) for segs in video_segments.values())
+            per_run = sum(prebuild_gemini_call_count(p, segs) for segs in video_segments.values())
             print(f"    {p.value}: {per_run}")
         print(f"  Query calls: {n_query_calls}")
         n_video_query = sum(
@@ -441,7 +441,7 @@ async def run_gepa_prebuild(args, selected, durations):
     # Only need TRANSCRIPT and MIXED (which builds both transcript + summary per segment)
     prebuild_policies = (Policy.TRANSCRIPT, Policy.MIXED)
     n_build_calls = sum(
-        sum(prebuild_gemini_call_count(p, len(segs)) for p in prebuild_policies)
+        sum(prebuild_gemini_call_count(p, segs) for p in prebuild_policies)
         for segs in video_segments.values()
     )
 
@@ -463,22 +463,37 @@ async def run_gepa_prebuild(args, selected, durations):
     print("  Pre-build complete.")
 
 
-async def run_gepa_eval(args, directive: str, test_videos: dict, durations: dict):
-    """Evaluate a GEPA-learned directive on the test set alongside baselines."""
+async def run_gepa_eval(
+    args, directive: str, test_videos: dict, durations: dict,
+    extra_candidates: list[dict] | None = None,
+):
+    """Evaluate a GEPA-learned directive on the test set alongside baselines.
+
+    `extra_candidates`: optional list of {"index", "score", "directive"} dicts
+    for non-best GEPA candidates. Each is plotted as `gepa-c{index}` with its
+    own routing + materialization + queries. The best directive remains
+    plotted as `llm-routed`.
+    """
     from google import genai as genai_mod
     client = genai_mod.Client()
     sem = asyncio.Semaphore(args.concurrency)
     model = args.model
+    extra_candidates = extra_candidates or []
 
     ordered_vids = sorted(test_videos.keys(), key=lambda v: durations[v], reverse=True)
     video_segments = {}
     for vid in ordered_vids:
         video_segments[vid] = segment_video(durations[vid], args.segment_length)
 
-    # Pre-build materializations for test videos too
-    prebuild_policies = (Policy.TRANSCRIPT, Policy.MIXED, Policy.VISUAL_DESCRIPTION, Policy.SUMMARY)
+    # Pre-build materializations for test videos. LLoVi sparse is a strict subset
+    # of LLoVi dense (same per-clip cache keys), so we only pre-build dense; sparse
+    # will hit cache during the per-policy materialize-for-query phase below.
+    prebuild_policies = (
+        Policy.TRANSCRIPT, Policy.MIXED, Policy.VISUAL_DESCRIPTION, Policy.SUMMARY,
+        Policy.LLOVI_DENSE,
+    )
     n_build_calls = sum(
-        sum(prebuild_gemini_call_count(p, len(segs)) for p in prebuild_policies)
+        sum(prebuild_gemini_call_count(p, segs) for p in prebuild_policies)
         for segs in video_segments.values()
     )
     print("\n=== Pre-building materializations for test videos ===")
@@ -498,32 +513,63 @@ async def run_gepa_eval(args, directive: str, test_videos: dict, durations: dict
         await asyncio.gather(*build_tasks)
     print("  Pre-build complete.")
 
-    # Run LLM router on test videos with the learned directive
-    print("\n=== Routing test videos with learned directive ===")
+    # Route all GEPA directives (best + extra candidates) on test videos.
+    # The router cache is keyed by (video, directive_hash), so re-routing on
+    # cached directives is free.
+    import hashlib
+    print("\n=== Routing test videos with GEPA directives ===")
     router_client = genai_mod.Client()
-    routing_decisions_by_vid: dict[str, list[str]] = {}
-    for vid in ordered_vids:
-        decisions = route_video_segments(
-            router_client, vid, video_segments[vid], directive,
-            model=ROUTER_MODEL_NAME,
-        )
-        routing_decisions_by_vid[vid] = decisions
-        n_t = decisions.count("TRANSCRIPT")
-        n_s = decisions.count("SUMMARY")
-        n_v = decisions.count("LOW_FPS")
-        n_k = decisions.count("SKIP")
-        print(f"  {vid}: T={n_t} S={n_s} V={n_v} K={n_k}")
 
-    # Evaluate LLM_ROUTED + baselines
+    def _hash16(s: str) -> str:
+        return hashlib.sha256(s.encode()).hexdigest()[:16]
+
+    directive_hash = _hash16(directive)
+
+    # Build the list of (label, directive, hash) for all GEPA points to plot.
+    gepa_views = [("llm-routed", directive, directive_hash)]
+    for cand in extra_candidates:
+        gepa_views.append((
+            f"gepa-c{cand['index']}",
+            cand["directive"],
+            _hash16(cand["directive"]),
+        ))
+
+    routings_by_label: dict[str, dict[str, list[str]]] = {}
+    for label, dtv, _ in gepa_views:
+        print(f"  [{label}]")
+        per_vid: dict[str, list[str]] = {}
+        for vid in ordered_vids:
+            decisions = route_video_segments(
+                router_client, vid, video_segments[vid], dtv,
+                model=ROUTER_MODEL_NAME,
+            )
+            per_vid[vid] = decisions
+            n_t = decisions.count("TRANSCRIPT")
+            n_s = decisions.count("SUMMARY")
+            n_v = decisions.count("LOW_FPS")
+            n_k = decisions.count("SKIP")
+            print(f"    {vid}: T={n_t} S={n_s} V={n_v} K={n_k}")
+        routings_by_label[label] = per_vid
+
+    # Evaluate baselines + LLoVi + every GEPA view.
     baseline_policies = [Policy(p.strip()) for p in args.policies.split(",")]
-    all_policies = baseline_policies + [Policy.LLM_ROUTED]
+    for llovi_p in (Policy.LLOVI_DENSE, Policy.LLOVI_SPARSE):
+        if llovi_p not in baseline_policies:
+            baseline_policies.append(llovi_p)
 
-    # Materialize for all policies
+    # PolicyView: label (CSV/chart key), policy (API dispatch), routing_hash (cache key).
+    # For baselines: label=p.value, policy=p, hash=None.
+    # For each GEPA view: label=view label, policy=LLM_ROUTED, hash=directive's hash.
+    PolicyView = tuple  # (label: str, policy: Policy, routing_hash: str | None)
+    all_views: list[PolicyView] = [(p.value, p, None) for p in baseline_policies]
+    all_views.extend((label, Policy.LLM_ROUTED, h) for label, _, h in gepa_views)
+
+    # Materialize for baselines (real builders).
     mat_keys = []
     materialize_tasks_list = []
     for p in baseline_policies:
         for vid in ordered_vids:
-            mat_keys.append((p, vid))
+            mat_keys.append((p.value, vid))
             materialize_tasks_list.append(
                 materialize_video(
                     client, p, vid,
@@ -533,47 +579,44 @@ async def run_gepa_eval(args, directive: str, test_videos: dict, durations: dict
             )
     materialize_results = await asyncio.gather(*materialize_tasks_list)
     video_materials = {
-        (p.value, vid): res for (p, vid), res in zip(mat_keys, materialize_results)
+        (label, vid): res for (label, vid), res in zip(mat_keys, materialize_results)
     }
 
-    # Add LLM_ROUTED materializations (from routing decisions, no API calls)
-    for vid in ordered_vids:
-        materialized = materialize_from_routing(
-            vid, video_segments[vid], routing_decisions_by_vid[vid],
-        )
-        video_materials[(Policy.LLM_ROUTED.value, vid)] = (materialized, [])
-
-    # Run queries for all policies
-    total_questions = sum(len(qs) for qs in test_videos.values())
-    all_results: dict[str, list[dict]] = {p.value: [] for p in all_policies}
-    all_token_logs: dict[str, list[PolicyTokenLog]] = {p.value: [] for p in all_policies}
-
-    token_log_by_pv: dict[tuple[str, str], PolicyTokenLog] = {}
-    for policy in all_policies:
+    # Materialize each GEPA view from its routing decisions (no API calls).
+    for label, _, _ in gepa_views:
         for vid in ordered_vids:
-            materialized, build_usages = video_materials[(policy.value, vid)]
-            token_log = PolicyTokenLog(
-                policy=policy.value, video_id=vid, build_usage=build_usages,
+            materialized = materialize_from_routing(
+                vid, video_segments[vid], routings_by_label[label][vid],
             )
-            all_token_logs[policy.value].append(token_log)
-            token_log_by_pv[(policy.value, vid)] = token_log
+            video_materials[(label, vid)] = (materialized, [])
 
-    import hashlib
-    directive_hash = hashlib.sha256(directive.encode()).hexdigest()[:16]
+    # Run queries for every view.
+    total_questions = sum(len(qs) for qs in test_videos.values())
+    all_results: dict[str, list[dict]] = {label: [] for label, _, _ in all_views}
+    all_token_logs: dict[str, list[PolicyTokenLog]] = {label: [] for label, _, _ in all_views}
+
+    token_log_by_lv: dict[tuple[str, str], PolicyTokenLog] = {}
+    for label, _, _ in all_views:
+        for vid in ordered_vids:
+            materialized, build_usages = video_materials[(label, vid)]
+            token_log = PolicyTokenLog(
+                policy=label, video_id=vid, build_usage=build_usages,
+            )
+            all_token_logs[label].append(token_log)
+            token_log_by_lv[(label, vid)] = token_log
 
     query_tasks = []
     task_meta = []
-    total_query_tasks = total_questions * len(all_policies)
+    total_query_tasks = total_questions * len(all_views)
     with Progress(*_PROGRESS_COLUMNS) as progress:
         task_id = progress.add_task("  Queries", total=total_query_tasks)
         pbar = Pbar(progress, task_id)
-        for policy in all_policies:
-            r_hash = directive_hash if policy == Policy.LLM_ROUTED else None
+        for label, policy, r_hash in all_views:
             for vid in ordered_vids:
                 youtube_url = f"https://www.youtube.com/watch?v={vid}"
                 segs = video_segments[vid]
-                materialized, _ = video_materials[(policy.value, vid)]
-                token_log = token_log_by_pv[(policy.value, vid)]
+                materialized, _ = video_materials[(label, vid)]
+                token_log = token_log_by_lv[(label, vid)]
                 for entry in test_videos[vid]:
                     query_tasks.append(
                         answer_question(
@@ -583,19 +626,19 @@ async def run_gepa_eval(args, directive: str, test_videos: dict, durations: dict
                             routing_hash=r_hash,
                         ),
                     )
-                    task_meta.append((policy, vid, entry, token_log))
+                    task_meta.append((label, vid, entry, token_log))
         query_results = await asyncio.gather(*query_tasks)
 
-    for (policy, vid, entry, token_log), (
+    for (label, vid, entry, token_log), (
         predicted_id, raw_response, raw_thoughts, usage,
     ) in zip(task_meta, query_results):
         token_log.query_usage.append(usage)
-        all_results[policy.value].append({
+        all_results[label].append({
             "video_id": vid,
             "question_key": entry["key"],
             "predicted_id": predicted_id,
             "answer_id": entry["answer_id"],
-            "policy": policy.value,
+            "policy": label,
             "raw_response": raw_response,
             "raw_thoughts": raw_thoughts,
         })
@@ -606,10 +649,10 @@ async def run_gepa_eval(args, directive: str, test_videos: dict, durations: dict
     gepa_results_dir.mkdir(parents=True, exist_ok=True)
 
     summary_rows = []
-    for policy in all_policies:
-        preds = all_results[policy.value]
+    for label, _, _ in all_views:
+        preds = all_results[label]
         eval_result = evaluate(preds)
-        logs = all_token_logs[policy.value]
+        logs = all_token_logs[label]
 
         total_build = sum(log.total_build_tokens for log in logs)
         total_query = sum(log.total_query_tokens for log in logs)
@@ -628,7 +671,7 @@ async def run_gepa_eval(args, directive: str, test_videos: dict, durations: dict
         query_lat_s, query_n_api, query_mean_s = _latency_stats(query_usages_flat)
 
         row = {
-            "policy": policy.value,
+            "policy": label,
             "accuracy": eval_result["accuracy"],
             "correct": eval_result["correct"],
             "total": eval_result["total"],
@@ -651,7 +694,7 @@ async def run_gepa_eval(args, directive: str, test_videos: dict, durations: dict
         }
         summary_rows.append(row)
 
-        print(f"\n{policy.value}:")
+        print(f"\n{label}:")
         print(f"  Accuracy: {eval_result['accuracy']:.1%} ({eval_result['correct']}/{eval_result['total']})")
         print(f"  Unparsed: {eval_result['unparsed']}")
         print(f"  Build tokens: {total_build:,}")
@@ -719,16 +762,33 @@ def main():
         )
 
     elif args.gepa_eval:
-        # Evaluate GEPA-learned directive on test set
+        # Evaluate GEPA-learned directive on test set, plus all other GEPA
+        # candidates as additional points (gepa-c{index}) on the chart.
         result_data = json.loads(Path(args.gepa_eval).read_text())
         directive = result_data["best_candidate"]
         print(f"Loaded directive from {args.gepa_eval}")
         print(f"  Score: {result_data['best_score']:.3f}")
         print(f"  Directive:\n{directive}\n")
 
+        all_candidates = result_data.get("all_candidates", []) or []
+        extra_candidates = [
+            c for c in all_candidates
+            if isinstance(c, dict)
+            and c.get("directive")
+            and c["directive"] != directive
+        ]
+        if extra_candidates:
+            print(f"  Plus {len(extra_candidates)} non-best GEPA candidate(s):")
+            for c in extra_candidates:
+                print(f"    gepa-c{c['index']} (score={c.get('score', 'n/a')})")
+            print()
+
         selected, durations = select_videos(args.top_k)
         train, test = train_test_split(selected)
-        asyncio.run(run_gepa_eval(args, directive, test, durations))
+        asyncio.run(run_gepa_eval(
+            args, directive, test, durations,
+            extra_candidates=extra_candidates,
+        ))
 
     else:
         asyncio.run(run_experiment_async(args))
